@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparsecache"
+version = "0.1.0"
+description = "Reference implementation of reusable RAG chunk KV caches"
+requires-python = ">=3.11"
+dependencies = [
+  "safetensors>=0.4",
+  "torch>=2.6",
+  "transformers>=4.57,<5",
+]
+
+[project.scripts]
+sparsecache-prepare = "sparsecache.data:main"
+sparsecache-precompute = "sparsecache.precompute:main"
+sparsecache-qa = "sparsecache.qa:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 88

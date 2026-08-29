@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "status": "pre-registered execution matrix; not paper results",
+  "method": {
+    "verification_mode": "final_only",
+    "commit_window": "inf",
+    "draft_cache_mode": "s1",
+    "draft_stage_policy": "first",
+    "protected_prompt_tokens": {
+      "prefix": 256,
+      "suffix": 512,
+      "first_bundle_is_atomic": true
+    },
+    "reuse_final_verify": true,
+    "longbench_prompt_mode": "official_chat",
+    "timing_protocol": {
+      "fixed_token_horizon": true,
+      "paired_measurement": true,
+      "eager_serial_wire": true,
+      "exclusive_gpu": true,
+      "warm_both_paths": true,
+      "alternate_order_by_dataset_index": true,
+      "outlier_policy": "rerun contaminated cell; never trim requests"
+    }
+  },
+  "baselines": [
+    "full_exact_kv_transfer",
+    "layerwise_pd_transfer",
+    "magicdec_triforce_local_sparse_self_speculation",
+    "quantspec_hierarchical_quantized_self_speculation",
+    "lynx_split_precision_progressive_transfer",
+    "smartgen_selective_transfer_on_demand_fetch",
+    "oasiskv_lookahead_sparse_prefetch",
+    "dustin_sparse_verification_lossy_control",
+    "specpv_partial_verification_lossy_control"
+  ],
+  "baseline_evidence_policy": {
+    "endpoint_tables": {
+      "exact_bf16": [
+        "full_exact_kv_transfer",
+        "layerwise_pd_transfer",
+        "sparsecache_pd_fixed_s1",
+        "sparsecache_pd_continuous"
+      ],
+      "accuracy_latency_pareto": [
+        "bf16_transfer",
+        "int8_transfer",
+        "int4_transfer",
+        "lynx_authors_paper",
+        "sparsecache_pd_exact",
+        "explicit_lossy_controls"
+      ]
+    },
+    "lynx": {
+      "source": "https://arxiv.org/abs/2607.01831",
+      "pdf_sha256_20260827": "f918a1f951293c488e63a576f6464a416dce9d59275b22e31a6c4615ea507299",
+      "current_evidence_label": "authors_paper_only",
+      "public_author_code_found": false,
+      "official_reproduction_allowed": false,
+      "surrogate_must_not_be_named_reproduction": true,
+      "completed_target": "hierarchical_int8_q_full",
+      "bf16_relationship": "task_score_equivalence_not_zero_quantization_error",
+      "paper_page_tokens": 256,
+      "paper_chunk_tokens": 32,
+      "anchor_bits_per_coordinate": 4,
+      "residual_bits_per_coordinate": 4,
+      "max_speculative_tokens": 64,
+      "paper_bandwidth_gbps": [10, 25, 50],
+      "missing_for_faithful_local_reproduction": [
+        "log_transform_alpha",
+        "epsilon_and_scalar_precision",
+        "exact_scalar_byte_amortization",
+        "inverse_sign_reconstruction_details",
+        "packed_metadata_layout",
+        "ascend_kernel_source"
+      ],
+      "protocol": "docs/LYNX_BASELINE_PROTOCOL.md"
+    },
+    "quantspec": {
+      "source": "https://github.com/SqueezeAILab/QuantSpec",
+      "audited_commit_20260827": "661366739d89c14269c6204dddcb164727e8be7b",
+      "current_evidence_label": "official_source_audited_reproduction_pending",
+      "public_author_code_found": true,
+      "local_reproduction_complete": false,
+      "endpoint_classification": "compute_only_candidate_pending_bf16_equality_gate",
+      "progressive_pd_transfer_in_author_code": false,
+      "separate_environment_required": true,
+      "repository_license_file_found": false,
+      "vendoring_allowed": false,
+      "documented_environment": {
+        "python": "3.11",
+        "cuda": "12.1",
+        "gcc": "13.2.0",
+        "torch": "2.4.0",
+        "transformers": "4.36.2"
+      },
+      "reproduction_blockers": [
+        "exclusive_gpu_unavailable",
+        "separate_python311_environment_not_created",
+        "marlin_submodule_and_build_not_pinned",
+        "converted_model_checkpoint_not_prepared",
+        "request_level_paired_wrapper_not_implemented",
+        "repository_license_not_clarified"
+      ],
+      "protocol": "docs/QUANTSPEC_BASELINE_AUDIT.md"
+    }
+  },
+  "selection_split": {
+    "requests": 30,
+    "transport_gbps": [25, 50, 100, 200, 400],
+    "priority_fraction": [0.02, 0.05, 0.1],
+    "draft_tokens": [2, 4, 6, 8, 12],
+    "page_tokens": [128, 256, 512],
+    "schedules": ["sequential", "uniform", "random", "query", "oracle"],
+    "draft_visibility": [
+      "fixed_s1",
+      "continuous_arrival_mask_no_replay",
+      "coarse_graft_negative_control"
+    ],
+    "progressive_focus_cells": {
+      "transport_gbps": [25, 50],
+      "draft_tokens": [16, 32],
+      "arrival_bundles": [4, 8, 16]
+    }
+  },
+  "semantic_scheduling": {
+    "status": "audited sidecars and paired live queue materialized; execution pending exclusive GPUs",
+    "dataset": "RULER qa_2",
+    "prompt_tokens": 65536,
+    "chunk_tokens": 256,
+    "schedules": ["sequential", "uniform", "random", "bm25", "oracle"],
+    "online_schedules": ["sequential", "uniform", "random", "bm25"],
+    "oracle_role": "analysis_upper_bound",
+    "visibility_arms": ["fixed_s1", "continuous"],
+    "bandwidth_gbps": [25, 50],
+    "selection_rows": [0, 100],
+    "confirmation_rows": [100, 200],
+    "paired_execution": "request-interleaved schedule_x_visibility rotation",
+    "runtime_gate": "coalesced link bundle chunk sets equal priority sidecar slices",
+    "audit": "outputs/progressive_kv/pd_packs/llama31_8b/schedules/ruler_qa2/65536/original/audit.json",
+    "live_queue": "outputs/progressive_kv/live_scheduling_queue_llama31_8b_20260827.json"
+  },
+  "sparse_draft_crossover": {
+    "purpose": "compute-only proof that exact sparse-page drafting is cheaper before claiming P/D overlap",
+    "primary_model": "Llama-3.1-8B-Instruct",
+    "context_tokens": [16384, 32768, 65536, 131008],
+    "primary_draft_tokens": 8,
+    "gamma_sweep_context_tokens": 65536,
+    "draft_token_sweep": [4, 8, 16, 32],
+    "visible_fraction": [0.02, 0.05, 0.1, 0.25, 0.5, 1.0],
+    "selection_repeats_per_fraction": 30,
+    "confirmation_repeats_per_fraction": 100,
+    "warmup_repeats": 3,
+    "page_tokens": 64,
+    "prefix_cache_policy": "block_aligned_prompt_plus_changing_one_token_seed",
+    "primary_control": "same_PROGRESSIVE_KV_engine_with_100pct_pages",
+    "secondary_control": "ordinary_FLASH_ATTN_engine",
+    "selection_success_rule": {
+      "maximum_visible_fraction": 0.1,
+      "minimum_draft_speedup": 1.1,
+      "paired_95pct_ci_saved_ms_above_zero": true,
+      "maximum_progressive_backend_overhead_ratio": 1.1
+    },
+    "protocol": "docs/SPARSE_DRAFT_CROSSOVER_PROTOCOL.md"
+  },
+  "confirmation_split": {
+    "latency_requests_per_cell": 100,
+    "quality_requests_per_dataset": "all available, capped only by dataset size",
+    "paired_bootstrap_samples": 10000,
+    "confidence_level": 0.95,
+    "primary_latency_horizons": [32, 64],
+    "quality_output_policy": "public LongBench per-dataset max_new_tokens with natural EOS",
+    "report_percentiles": [50, 95, 99]
+  },
+  "datasets": [
+    {"name": "2wikimqa", "path": "/data/datasets/longbench/2wikimqa.jsonl", "available": 200, "capability": "multi-hop QA", "official_max_new_tokens": 32, "metric": "qa_f1"},
+    {"name": "hotpotqa", "path": "/data/datasets/longbench/hotpotqa.jsonl", "available": 200, "capability": "multi-hop QA", "official_max_new_tokens": 32, "metric": "qa_f1"},
+    {"name": "musique", "path": "/data/datasets/longbench/musique.jsonl", "available": 200, "capability": "multi-hop QA", "official_max_new_tokens": 32, "metric": "qa_f1"},
+    {"name": "qasper", "path": "/data/datasets/longbench/qasper.jsonl", "available": 200, "capability": "document QA", "official_max_new_tokens": 128, "metric": "qa_f1"},
+    {"name": "multifieldqa_en", "path": "/data/datasets/longbench/multifieldqa_en.jsonl", "available": 150, "capability": "document QA", "official_max_new_tokens": 64, "metric": "qa_f1"},
+    {"name": "narrativeqa", "path": "/data/datasets/longbench/narrativeqa.jsonl", "available": 200, "capability": "document QA", "official_max_new_tokens": 128, "metric": "qa_f1"},
+    {"name": "qmsum", "path": "/data/datasets/longbench/qmsum.jsonl", "available": 200, "capability": "summarization", "official_max_new_tokens": 512, "metric": "rouge_l_f1"},
+    {"name": "gov_report", "path": "/data/datasets/longbench/gov_report.jsonl", "available": 200, "capability": "summarization", "official_max_new_tokens": 512, "metric": "rouge_l_f1"},
+    {"name": "multi_news", "path": "/data/datasets/longbench/multi_news.jsonl", "available": 200, "capability": "summarization", "official_max_new_tokens": 512, "metric": "rouge_l_f1"},
+    {"name": "passage_retrieval_en", "path": "/data/datasets/longbench/passage_retrieval_en.jsonl", "available": 200, "capability": "controlled retrieval", "official_max_new_tokens": 32, "metric": "retrieval_accuracy"},
+    {"name": "passage_count", "path": "/data/datasets/longbench/passage_count.jsonl", "available": 200, "capability": "controlled counting", "official_max_new_tokens": 32, "metric": "count_accuracy"},
+    {"name": "lcc", "path": "/data/datasets/longbench/lcc.jsonl", "available": 500, "capability": "code completion", "official_max_new_tokens": 64, "metric": "code_similarity"},
+    {"name": "repobench-p", "path": "/data/datasets/longbench/repobench-p.jsonl", "available": 500, "capability": "code completion", "official_max_new_tokens": 64, "metric": "code_similarity"}
+  ],
+  "controlled_context": {
+    "length_tokens": [16000, 32000, 64000, 128000],
+    "evidence_placement": ["first", "uniform", "last", "adversarial_split"],
+    "requests_per_cell": 200,
+    "dataset": "RULER qa_2 generated with Llama-3 tokenizer, seed 42",
+    "paths": {
+      "16000": "datasets/ruler/normalized/qa2_16384.jsonl",
+      "32000": "datasets/ruler/normalized/qa2_32768.jsonl",
+      "64000": "datasets/ruler/normalized/qa2_65536.jsonl",
+      "128000": "datasets/ruler/normalized/qa2_131072.jsonl"
+    },
+    "supporting_documents_per_request": 2,
+    "primary_model_max_prompt_tokens": 131040,
+    "output_reserve_tokens": 32
+  },
+  "longbench_v2": {
+    "path": "/data/datasets/LongBench-v2/data.json",
+    "available": 503,
+    "sample_policy": "stratify by domain, difficulty, and length category",
+    "prompt": "public direct-answer 0-shot template",
+    "official_max_new_tokens": 128,
+    "metric": "choice_accuracy",
+    "llama31_8b_max_context_tokens": 120000,
+    "context_truncation": "middle"
+  },
+  "models": [
+    {"name": "Llama-3.1-8B-Instruct", "path": "/data/models/llama/Llama-3.1-8B-Instruct", "max_position_embeddings": 131072, "role": "development_and_primary"},
+    {"name": "Qwen3-8B", "path": "/data/models/qwen/Qwen3-8B", "max_position_embeddings": 40960, "role": "natural_LongBench_replication_up_to_32K"},
+    {"name": "DeepSeek-R1-Distill-Qwen-7B", "path": "/data/models/deepseek/DeepSeek-R1-Distill-Qwen-7B", "max_position_embeddings": 131072, "role": "second_long_context_architecture"},
+    {"name": "Qwen3-Coder-30B-A3B-Instruct", "path": "/data/models/qwen/Qwen3-Coder-30B-A3B-Instruct", "max_position_embeddings": 262144, "role": "scale_and_MoE_replication"}
+  ],
+  "second_model_materialization": {
+    "status": "Qwen3-8B request packs and live queue audited; live execution pending exclusive GPUs",
+    "model": "Qwen3-8B",
+    "thinking_mode": "disabled",
+    "max_prompt_tokens": 32768,
+    "logical_bf16_kv_bytes_per_token": 147456,
+    "packs": {
+      "longbench": {
+        "datasets": 13,
+        "requests": 3150,
+        "prompt_tokens": 32232192,
+        "audit": "outputs/progressive_kv/pd_packs/qwen3_8b/quality_audit.json"
+      },
+      "longbench_v2": {
+        "datasets": 1,
+        "requests": 503,
+        "prompt_tokens": 15155712,
+        "audit": "outputs/progressive_kv/pd_packs/qwen3_8b/longbench_v2_audit.json"
+      },
+      "ruler_qa2": {
+        "length_tokens": [16384, 32768],
+        "placements": 5,
+        "requests_per_cell": 200,
+        "requests": 2000,
+        "prompt_tokens": 49152000,
+        "audit": "outputs/progressive_kv/pd_packs/qwen3_8b/controlled/ruler_qa2_audit.json"
+      }
+    },
+    "live_queue": {
+      "path": "outputs/progressive_kv/live_queue_qwen3_8b_20260827.json",
+      "jobs": 46,
+      "core_mechanism": 12,
+      "controlled_confirmation": 20,
+      "natural_quality": 14,
+      "bandwidth_gbps": [25, 50]
+    }
+  },
+  "system_track": {
+    "transport": ["paced_single_host", "two_node_tcp", "two_node_rdma"],
+    "batch_size": [1, 4, 8, 16],
+    "output_tokens": [16, 64, 256],
+    "load": ["low", "knee", "saturation"],
+    "minimum_requests": 1000,
+    "minimum_steady_state_seconds": 300
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "model": "/data/models/llama/Llama-3.1-8B-Instruct",
+  "case": "datasets/cases/hotpotqa_e_case0_10chunks.json",
+  "cache": "cpukv/llama31_8b_hotpotqa_e_case0",
+  "device": "cuda:1",
+  "dtype": "bfloat16",
+  "check_layer": 1,
+  "recompute_ratio": 0.15,
+  "max_new_tokens": 16
+}

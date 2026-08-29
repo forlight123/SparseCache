@@ -1,0 +1,34 @@
+__pycache__/
+.venv*/
+**/.venv*/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+*.py[cod]
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.nsys-rep
+*.sqlite
+*.tmp
+
+# Generated experiments, cache files, and raw/local datasets.
+outputs/*
+!outputs/.gitkeep
+cpukv/*
+!cpukv/.gitkeep
+datasets/*
+!datasets/README.md
+
+# Physical third-party working copies are intentionally not vendored. Clone
+# the compatible revisions separately when running systems integration.
+CacheBlend/
+LMCache/
+vllm/
+
+# Common local model/data mount points.
+models/
+checkpoints/
+wandb/
