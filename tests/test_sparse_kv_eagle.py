@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 
 from experiments.train_sparse_kv_eagle import (
+    compressed_distillation_loss,
     configure_trainable_modules,
     load_adapter_checkpoint,
 )
@@ -129,3 +130,47 @@ def test_training_scope_and_resume_adapter(tmp_path: Path) -> None:
     loaded = load_adapter_checkpoint(model, checkpoint)
     assert loaded["completed_steps"] == 17
     assert model.adapter_scale.item() == 1.25
+
+
+def test_gated_delta_fusion_is_initialized_and_memory_dependent() -> None:
+    config = tiny_config()
+    config = SparseKVEagleConfig(**{**config.to_dict(), "fusion_mode": "gated_delta"})
+    model = SparseKVEagleDrafter(config)
+    model.bind_target_embedding(torch.randn(32, 16))
+    logits = model(
+        torch.tensor([[1, 2]]),
+        torch.randn(1, 2, 16),
+        torch.randn(2, 2, 5, 4),
+        torch.randn(2, 2, 5, 4),
+        torch.randn(2, 4),
+        torch.randn(2, 4),
+        visible_fraction=0.2,
+        prompt_tokens=32,
+    )
+    assert logits.shape == (1, 2, 16)
+    logits.sum().backward()
+    assert model.memory_gate.weight.grad is not None
+    assert model.memory_delta.weight.grad is not None
+
+
+def test_compressed_loss_handles_unmapped_hard_labels() -> None:
+    model = SparseKVEagleDrafter(tiny_config())
+    model.target_to_draft[20] = 0
+    logits = torch.randn(1, 2, 16, requires_grad=True)
+    labels = torch.tensor([21, 21])
+    teacher_ids = torch.tensor([[20, 21], [20, 21]])
+    teacher_logprobs = torch.zeros(2, 2)
+    loss, components = compressed_distillation_loss(
+        model,
+        logits,
+        labels,
+        teacher_ids,
+        teacher_logprobs,
+        prefix_decay=0.9,
+        hard_weight=1.0,
+        soft_weight=0.5,
+    )
+    assert torch.isfinite(loss)
+    assert components["label_coverage"] == 0.0
+    loss.backward()
+    assert logits.grad is not None

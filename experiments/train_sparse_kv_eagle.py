@@ -16,6 +16,7 @@ import torch.nn.functional as F
 
 from experiments.train_sparse_kv_drafter import (
     TeacherSample,
+    feature_distillation_loss,
     _sample_inputs,
     load_teacher_dataset,
     parse_fraction_list,
@@ -60,6 +61,7 @@ def build_model(
     target_embedding: torch.Tensor,
     target_config: Any,
     device: torch.device,
+    fusion_mode: str = "scalar",
 ) -> SparseKVEagleDrafter:
     eagle_config_path = eagle_checkpoint.parent / "config.json"
     eagle_config = json.loads(eagle_config_path.read_text(encoding="utf-8"))
@@ -76,6 +78,7 @@ def build_model(
         target_vocab_size=int(manifest["vocab_size"]),
         draft_vocab_size=int(eagle_config["draft_vocab_size"]),
         rms_norm_eps=float(eagle_config.get("rms_norm_eps", 1e-5)),
+        fusion_mode=fusion_mode,
     )
     if int(target_config.vocab_size) != config.target_vocab_size:
         raise ValueError("target and EAGLE vocabulary sizes differ")
@@ -110,10 +113,13 @@ def compressed_distillation_loss(
     draft_labels = model.draft_ids(labels)
     valid_hard = draft_labels >= 0
     hard_weights = weights * valid_hard.float()
-    if hard_weights.sum() == 0:
-        raise ValueError("no teacher labels are covered by EAGLE's draft vocabulary")
     hard = -logprobs.gather(1, draft_labels.clamp_min(0)[:, None]).squeeze(1)
-    hard_loss = (hard * hard_weights).sum() / hard_weights.sum()
+    hard_denominator = hard_weights.sum()
+    hard_loss = torch.where(
+        hard_denominator > 0,
+        (hard * hard_weights).sum() / hard_denominator.clamp_min(1.0),
+        torch.zeros((), device=logits.device),
+    )
 
     teacher_draft_ids = model.draft_ids(teacher_topk_ids)
     valid_soft = teacher_draft_ids >= 0
@@ -128,7 +134,15 @@ def compressed_distillation_loss(
     selected_student = logprobs.gather(1, teacher_draft_ids.clamp_min(0))
     soft_per_token = -(teacher_probs * selected_student).sum(dim=-1)
     soft_weights = weights * valid_rows.float()
-    soft_loss = (soft_per_token * soft_weights).sum() / soft_weights.sum()
+    soft_denominator = soft_weights.sum()
+    soft_loss = torch.where(
+        soft_denominator > 0,
+        (soft_per_token * soft_weights).sum()
+        / soft_denominator.clamp_min(1.0),
+        torch.zeros((), device=logits.device),
+    )
+    if hard_denominator.item() == 0.0 and soft_denominator.item() == 0.0:
+        raise ValueError("teacher labels and top-k are outside EAGLE vocabulary")
     loss = hard_weight * hard_loss + soft_weight * soft_loss
     return loss, {
         "hard_loss": float(hard_loss.detach().item()),
@@ -153,7 +167,12 @@ def compressed_target_score(
     weights = weights * valid.float()
     logprobs = logits.float().log_softmax(dim=-1)[0]
     selected = logprobs.gather(1, draft_labels.clamp_min(0)[:, None]).squeeze(1)
-    return (weights * selected).sum() / weights.sum()
+    denominator = weights.sum()
+    return torch.where(
+        denominator > 0,
+        (weights * selected).sum() / denominator.clamp_min(1.0),
+        logprobs.sum() * 0.0,
+    )
 
 
 def pick_mismatched_sample(
@@ -387,8 +406,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contrast-weight", type=float, default=0.5)
     parser.add_argument("--contrast-margin", type=float, default=0.25)
     parser.add_argument("--base-contrast-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--feature-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "weight for cosine feature distillation against the full-target "
+            "hidden state (requires v2+ teacher data)"
+        ),
+    )
     parser.add_argument("--train-fc", action="store_true")
     parser.add_argument("--train-midlayer", action="store_true")
+    parser.add_argument(
+        "--fusion-mode",
+        choices=("scalar", "gated_delta"),
+        default="scalar",
+    )
     parser.add_argument("--adapter-scale-init", type=float, default=0.0)
     parser.add_argument("--adapter-scale-warmup-steps", type=int, default=0)
     parser.add_argument("--resume-adapter")
@@ -416,6 +449,8 @@ def main() -> None:
         raise ValueError("window, warmup, and checkpoint intervals cannot be negative")
     if not 0.0 <= args.initial_window_prob <= 1.0:
         raise ValueError("initial-window probability must be in [0, 1]")
+    if args.feature_weight < 0.0:
+        raise ValueError("feature weight cannot be negative")
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -465,6 +500,7 @@ def main() -> None:
         target_embedding=embedding,
         target_config=target_config,
         device=device,
+        fusion_mode=args.fusion_mode,
     )
     configure_trainable_modules(
         model,
@@ -557,9 +593,18 @@ def main() -> None:
                 teacher_topk_ids,
                 teacher_topk_logprobs,
             ) = _sample_inputs(sample, device)
+        teacher_hidden = sample.tensors.get("teacher_hidden")
+        if args.feature_weight > 0.0 and teacher_hidden is None:
+            raise ValueError("feature loss requires v2+ teacher hidden states")
+        if teacher_hidden is not None:
+            if window_offset == 0 and "initial_teacher_hidden" in sample.tensors:
+                teacher_hidden = sample.tensors["initial_teacher_hidden"]
+            teacher_hidden = teacher_hidden[
+                window_offset : window_offset + input_ids.shape[1]
+            ].to(device)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = model(
+            logits, features = model(
                 input_ids,
                 seed_hidden,
                 memory_keys,
@@ -568,6 +613,7 @@ def main() -> None:
                 query_sin,
                 visible_fraction=actual_fraction,
                 prompt_tokens=sample.prompt_tokens,
+                return_features=True,
             )
             loss, components = compressed_distillation_loss(
                 model,
@@ -579,6 +625,14 @@ def main() -> None:
                 hard_weight=args.hard_weight,
                 soft_weight=args.soft_weight,
             )
+            feature_loss = torch.zeros((), device=device)
+            if args.feature_weight > 0.0:
+                feature_loss = feature_distillation_loss(
+                    features,
+                    teacher_hidden,
+                    prefix_decay=args.prefix_decay,
+                )
+                loss = loss + args.feature_weight * feature_loss
             positive_score = compressed_target_score(
                 model, logits, labels, prefix_decay=args.prefix_decay
             )
@@ -642,6 +696,7 @@ def main() -> None:
             "loss": float(loss.detach().item()),
             "contrast_loss": float(contrast_loss.detach().item()),
             "base_contrast_loss": float(base_contrast.detach().item()),
+            "feature_loss": float(feature_loss.detach().item()),
             "gradient_norm": float(gradient_norm.detach().item()),
             "adapter_scale": float(torch.sigmoid(model.adapter_scale).detach().item()),
             **components,

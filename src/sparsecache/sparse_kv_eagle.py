@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """EAGLE-3 language prior conditioned on exact sparse verifier KV.
 
-The pretrained EAGLE parameters remain frozen.  A small trainable adapter issues
-queries directly into selected K/V tensors from several verifier layers.  This is
-deliberately different from running an unmodified EAGLE model with an incomplete
-prompt: sparse verifier KV is an explicit model input and receives gradients.
+By default the pretrained EAGLE trunk remains frozen while a small trainable
+adapter issues queries directly into selected K/V tensors from several verifier
+layers.  The training driver can optionally unfreeze the EAGLE projection or
+recurrent layer for controlled hybrid ablations.  This is deliberately
+different from running an unmodified EAGLE model with an incomplete prompt:
+sparse verifier KV is an explicit model input and receives gradients.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ class SparseKVEagleConfig:
     target_vocab_size: int = 128256
     draft_vocab_size: int = 32000
     rms_norm_eps: float = 1e-5
+    fusion_mode: str = "scalar"
 
     def __post_init__(self) -> None:
         if self.hidden_size != self.num_attention_heads * self.head_dim:
@@ -52,6 +55,8 @@ class SparseKVEagleConfig:
             self.draft_vocab_size,
         ) <= 0:
             raise ValueError("all architecture sizes must be positive")
+        if self.fusion_mode not in {"scalar", "gated_delta"}:
+            raise ValueError("fusion_mode must be scalar or gated_delta")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -195,6 +200,18 @@ class SparseKVEagleDrafter(nn.Module):
         )
         self.memory_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.memory_attention = SparseTargetKVAttention(memory_config)
+        self.memory_gate = nn.Linear(3 * config.hidden_size, config.hidden_size)
+        self.memory_delta = nn.Linear(config.hidden_size, config.hidden_size)
+        nn.init.zeros_(self.memory_gate.weight)
+        nn.init.constant_(self.memory_gate.bias, -1.0)
+        nn.init.eye_(self.memory_delta.weight)
+        nn.init.zeros_(self.memory_delta.bias)
+        if config.fusion_mode == "scalar":
+            for parameter in (
+                *self.memory_gate.parameters(),
+                *self.memory_delta.parameters(),
+            ):
+                parameter.requires_grad_(False)
         self.adapter_scale = nn.Parameter(torch.tensor(-4.0))
         self.stage_layer_bias = nn.Linear(2, config.num_memory_layers, bias=True)
         nn.init.zeros_(self.stage_layer_bias.weight)
@@ -237,6 +254,14 @@ class SparseKVEagleDrafter(nn.Module):
             f"memory_attention.{kind}.{index}.weight"
             for kind in ("query", "output")
             for index in range(self.config.num_memory_layers)
+        )
+        allowed_missing.update(
+            {
+                "memory_gate.weight",
+                "memory_gate.bias",
+                "memory_delta.weight",
+                "memory_delta.bias",
+            }
         )
         if set(missing) != allowed_missing or unexpected:
             raise ValueError(
@@ -299,7 +324,13 @@ class SparseKVEagleDrafter(nn.Module):
             sin,
             layer_logits_bias=stage_gates,
         )
-        return torch.sigmoid(self.adapter_scale).to(hidden.dtype) * delta
+        scale = torch.sigmoid(self.adapter_scale).to(hidden.dtype)
+        if self.config.fusion_mode == "scalar":
+            return scale * delta
+        correction = delta - hidden
+        gate_input = torch.cat((hidden, delta, correction), dim=-1)
+        gate = torch.sigmoid(self.memory_gate(gate_input))
+        return scale * gate * self.memory_delta(correction)
 
     def forward(
         self,

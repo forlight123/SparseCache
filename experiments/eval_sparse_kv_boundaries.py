@@ -225,7 +225,10 @@ def main() -> None:
         ).to(device)
         model.load_state_dict(checkpoint["state_dict"], strict=True)
         model.bind_target_weights(embedding, lm_head)
-    elif checkpoint.get("format") == "sparsecache.sparse-kv-eagle-adapter.v1":
+    elif checkpoint.get("format") in {
+        "sparsecache.sparse-kv-eagle-adapter.v1",
+        "sparsecache.sparse-kv-eagle-adapter.v2",
+    }:
         from experiments.train_sparse_kv_eagle import (
             build_model,
             load_target_embedding,
@@ -240,6 +243,10 @@ def main() -> None:
             target_embedding=embedding,
             target_config=target_config,
             device=device,
+            fusion_mode=checkpoint.get(
+                "fusion_mode",
+                checkpoint.get("config", {}).get("fusion_mode", "scalar"),
+            ),
         )
         if "fc.weight" in checkpoint["adapter_state_dict"]:
             model.fc.float()

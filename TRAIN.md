@@ -392,7 +392,65 @@ Implement the gated hybrid and block-wise training first. If that model reaches
 good acceptance but is too slow, reduce cross-attended target layers and draft
 width before considering a pure KV-only drafter.
 
-## 12. What is not in Git
+## 12. GPU2 controlled runs (2026-08-30)
+
+The first 1,200-request expansion was built from six task packs (200 examples
+per task) and split by `request_index % 5`: 960 train / 240 held out.  The
+static v3 teacher files are about 170 GiB; the v5 eight-token trace extension
+adds about 230 MiB.  The long 64-token trace is intentionally a separate
+follow-up artifact because it is much more expensive to extract.
+
+The main run used the EAGLE-3 Llama-3.1-8B checkpoint, priority page selection,
+5/10/20% visible KV, an eight-token random boundary window, gated-delta fusion,
+trainable `fc`, and full-target hidden feature distillation (`--feature-weight
+0.25`).  It ran 9,600 steps on GPU2 (142.6M trainable parameters).  The
+independent boundary evaluator measured:
+
+| KV ablation | teacher-forced top-1 | mean accepted prefix | full-block accept |
+|---|---:|---:|---:|
+| exact, 5% | 26.77% | 0.424 | 14.74% |
+| exact, 10% | 26.71% | 0.425 | 15.05% |
+| exact, 20% | 26.69% | 0.426 | 14.82% |
+| zero KV | 23.32% | 0.387 | 12.87% |
+| shuffled KV | 17.92% | 0.320 | 8.19% |
+
+For comparison, the same checkpoint evaluated on the earlier n600 corpus with
+64-token traces reaches 0.777 exact versus 0.736 zero and 0.588 shuffled
+accepted prefix.  This distribution gap is why all future claims must include
+both the expanded held-out split and the original 64-token boundary split.
+
+The full-hybrid control (also 9,600 steps, 385.9M trainable parameters) reached
+0.466 exact versus 0.463 zero on the expanded boundary split.  It improves
+absolute prefix over gated-only, but its small exact-zero gap shows that simply
+unfreezing the EAGLE recurrent layer causes the drafter to rely more on its
+language prior than on sparse KV.  The gated-only run is therefore the current
+mechanistic baseline.
+
+The training loss now tolerates a window whose teacher labels are outside the
+compressed EAGLE vocabulary: hard-label and contrast terms become zero while
+valid top-k soft distillation remains active.  Such windows are reported by
+`label_coverage` rather than aborting a long run.
+
+Reproduce the expanded run after materializing the private teacher manifest:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 PYTHONPATH=src:. \
+.venv/bin/python -m experiments.train_sparse_kv_eagle \
+  --teacher-manifest outputs/progressive_kv/sparse_kv_draft_teacher/boundary64_multitask_n1200_trace8_20260830/manifest.json \
+  --eagle-checkpoint /data/models/eagle/EAGLE3-LLaMA3.1-Instruct-8B/pytorch_model.bin \
+  --output-dir outputs/progressive_kv/sparse_kv_eagle/gateddelta_feature_fcadapt_boundary8_n1200_s9600_trace8_20260830_run2 \
+  --eval-modulus 5 --eval-remainder 0 \
+  --visibility-fractions 0.05,0.10,0.20 --selection-mode priority --page-size 64 \
+  --fusion-mode gated_delta --train-fc \
+  --adapter-scale-init 0 --adapter-scale-warmup-steps 1000 \
+  --training-window-tokens 8 --initial-window-prob 0.25 \
+  --steps 9600 --learning-rate 1e-4 --weight-decay 0.01 \
+  --prefix-decay 0.9 --hard-weight 1.0 --soft-weight 0.5 \
+  --feature-weight 0.25 --contrast-weight 0.75 --base-contrast-weight 0.5 \
+  --max-eval-tokens 8 --log-every 400 --save-every 2400 --device cuda:0
+```
+
+## 13. What is not in Git
 
 Never commit these artifacts to this repository:
 
