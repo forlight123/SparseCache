@@ -62,6 +62,36 @@ def anchor_indices(num_chunks: int, fraction: float, mode: str) -> list[int]:
         return sorted(
             round(index * (num_chunks - 1) / (count - 1)) for index in range(count)
         )
+    if mode == "nested_protected_uniform":
+        # A progressive schedule needs one stable priority order: increasing
+        # the fraction may append chunks but must never evict an earlier
+        # Anchor.  Seed the order with the legacy 10% protected-uniform set so
+        # the validated 10% operating point is preserved, then greedily split
+        # the largest uncovered interval.  Prefer the global centre on ties.
+        protected = min(
+            num_chunks, max(min(num_chunks, 2), math.ceil(num_chunks * 0.1))
+        )
+        if protected == 1:
+            return [0]
+        seeds = [
+            round(index * (num_chunks - 1) / (protected - 1))
+            for index in range(protected)
+        ]
+        priority = [seeds[0], seeds[-1], *seeds[1:-1]]
+        selected = set(priority)
+        centre = (num_chunks - 1) / 2
+        while len(priority) < num_chunks:
+            candidate = max(
+                (index for index in range(num_chunks) if index not in selected),
+                key=lambda index: (
+                    min(abs(index - anchor) for anchor in selected),
+                    -abs(index - centre),
+                    -index,
+                ),
+            )
+            priority.append(candidate)
+            selected.add(candidate)
+        return sorted(priority[:count])
     if mode != "uniform":
         raise ValueError(f"unsupported anchor selection mode: {mode}")
     # Midpoints of equal-width bins are unique whenever count <= num_chunks.

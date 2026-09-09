@@ -59,6 +59,7 @@ PYTHONHASHSEED=0
 PYTHONPATH=<SparseCache>:<SparseCache>/experiments/lossless_pd/lmcache_pd/runtime_site:<LMCache>
 SPARSECACHE_ANCHOR_PATCH=1              # P
 SPARSECACHE_GATHER_FIRST=1              # P
+SPARSECACHE_ANCHOR_MODE=protected_uniform|nested_protected_uniform  # P
 SPARSECACHE_RECEIVER_PATCH=1            # D
 SPARSECACHE_ANCHOR_NOTIFY=udp://HOST:PORT       # P
 SPARSECACHE_ANCHOR_LISTEN=udp://HOST:PORT       # D
@@ -93,6 +94,7 @@ SPARSECACHE_DRAFTER_KIND=target
 SPARSECACHE_TARGET_DRAFTER_MODEL=/data/models/qwen/Qwen3-8B
 SPARSECACHE_DRAFT_LAYERS=0,1,2,...,35
 SPARSECACHE_DRAFT_TOKENS=9  # one t1 alignment + at most eight injected tokens
+SPARSECACHE_TARGET_ROOT_TOPK=1  # >1 is an experimental negative ablation
 SPARSECACHE_TARGET_DRAFTER_WARMUP_TOKENS=1024
 SPARSECACHE_ONLINE_DRAFT_MODE=observe|inject
 ```
@@ -102,11 +104,19 @@ prototype loads a second Hugging Face copy of the Target on D after vLLM has
 initialized, so the D launch must reserve roughly another model-weight-sized
 GPU allocation.  It is an integration/correctness gate, not the final memory
 architecture; production code should share vLLM weights and use a paged sparse
-attention kernel.  A first-proposal mismatch fails closed (no suffix is
-injected), and every injected suffix is still checked by vLLM against complete
-KV before commitment.  For the example above, launch the D custom proposer with
-`num_speculative_tokens=8`; paper metrics must report only accepted injected
-suffix tokens and must not count the `t1` alignment position.
+attention kernel.  At the default root top-k of one, a first-proposal mismatch
+fails closed (no suffix is injected); larger values precompute several
+first-token-conditioned branches but did not improve strict all-request
+progress in the initial online screen.  Every injected suffix is still checked
+by vLLM against complete KV before commitment.  For the example above, launch
+the D custom proposer with `num_speculative_tokens=8`; paper metrics must report
+only accepted injected suffix tokens and must not count the `t1` alignment
+position.
+
+`nested_protected_uniform` is the monotone systems-control schedule.  It
+preserves the validated 10% chunk set and only appends chunks at larger
+fractions.  It fixes set replacement but is not a substitute for a
+query-dependent relevance order.
 
 For exact frozen-packet replay, launch the CPU proxy through:
 

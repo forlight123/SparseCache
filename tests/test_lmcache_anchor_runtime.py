@@ -27,6 +27,17 @@ def test_protected_uniform_preserves_boundary_chunks_and_spreads_budget():
     assert anchor_indices(1, 0.01, "protected_uniform") == [0]
 
 
+def test_nested_protected_uniform_preserves_the_validated_ten_percent_set():
+    at_ten = anchor_indices(31, 0.1, "nested_protected_uniform")
+    at_fifteen = anchor_indices(31, 0.15, "nested_protected_uniform")
+    at_thirty = anchor_indices(31, 0.3, "nested_protected_uniform")
+
+    assert at_ten == [0, 10, 20, 30]
+    assert at_fifteen == [0, 10, 15, 20, 30]
+    assert set(at_ten) < set(at_fifteen) < set(at_thirty)
+    assert anchor_indices(1, 0.1, "nested_protected_uniform") == [0]
+
+
 @pytest.mark.parametrize("fraction", [0, -0.1, 1.1])
 def test_anchor_fraction_is_bounded(fraction):
     with pytest.raises(ValueError):

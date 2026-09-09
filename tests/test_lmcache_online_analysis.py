@@ -52,6 +52,28 @@ def test_online_trace_summary_counts_target_verified_progress():
     assert result["mean_accepted_injected_suffix_per_request"] == 0.5
 
 
+def test_online_trace_summary_counts_late_draft_as_zero_progress():
+    rows = [
+        draft("a"),
+        draft("b"),
+        handoff("a", True, (2, 3)),
+        {
+            "event": "online_verify_feedback",
+            "request_id": "a",
+            "accepted_prefix": 3,
+            "accepted_injected_suffix": 2,
+        },
+    ]
+
+    result = summarize(rows)
+
+    assert result["requests_with_draft"] == 2
+    assert result["handoffs"] == 1
+    assert result["handoff_rate"] == 0.5
+    assert result["mean_accepted_prefix_per_request"] == 1.5
+    assert result["mean_accepted_injected_suffix_per_request"] == 1.0
+
+
 def benchmark_row(record, pd_text, mono_text, pd_total, mono_total):
     return {
         "record_id": record,

@@ -152,6 +152,27 @@ def test_inject_drops_divergent_or_unmatched_blocks():
     ]
 
 
+def test_inject_selects_non_top1_root_branch_from_authoritative_target():
+    _REGISTRY.clear()
+    draft = ready_draft(first=17)
+    object.__setattr__(
+        draft,
+        "root_branches",
+        {17: (17, 19, 23, 29), 31: (31, 37, 41)},
+    )
+    _REGISTRY.publish(draft)
+    value = proposer(speculative_tokens=3)
+
+    output = value.propose(
+        [[31]],
+        np.array([4]),
+        np.array([[2, 3, 5, 11]]),
+    )
+
+    assert output == [[37, 41]]
+    assert value._pending_feedback[0].proposal_tokens == 3
+
+
 def test_observe_mode_never_injects_even_when_first_token_matches():
     _REGISTRY.clear()
     _REGISTRY.publish(ready_draft())
@@ -191,7 +212,9 @@ def test_next_step_feedback_reports_only_useful_injected_suffix(tmp_path):
         np.array([[2, 3, 5, 11, 17, 19, 31]]),
     ) == [[]]
     assert value._pending_feedback == []
-    rows = [json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()]
+    rows = [
+        json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()
+    ]
     feedback = next(row for row in rows if row["event"] == "online_verify_feedback")
     assert feedback["accepted_prefix"] == 2
     assert feedback["accepted_injected_suffix"] == 1

@@ -32,23 +32,39 @@ def summarize(rows: list[dict]) -> dict:
     feedback = [row for row in rows if row.get("event") == "online_verify_feedback"]
     injections = [row for row in handoffs if row.get("returned_proposals")]
     accepted = [int(row["accepted_prefix"]) for row in feedback]
-    accepted_suffix = [max(0, value - 1) for value in accepted]
-    requests = len(handoffs)
+    accepted_suffix = [
+        int(row.get("accepted_injected_suffix", max(0, value - 1)))
+        for row, value in zip(feedback, accepted)
+    ]
+    # Every live draft represents an attempted P/D request.  A draft that
+    # finishes after the D handoff contributes zero useful accepted tokens;
+    # excluding it would reward slower drafters and inflate the paper metric.
+    requests = len(drafts)
+    handoff_count = len(handoffs)
+    first_matches = sum(bool(row.get("first_proposal_matches")) for row in handoffs)
+    root_covered = sum(bool(row.get("root_branch_covered")) for row in handoffs)
     if len(feedback) > len(injections):
         raise ValueError("verifier feedback exceeds injected proposal blocks")
     if any(value <= 0 for value in accepted):
         raise ValueError("injected blocks must include the reconciled first token")
     return {
         "events": dict(sorted(counts.items())),
-        "requests_with_draft": len(drafts),
-        "handoffs": requests,
-        "first_token_matches": sum(
-            bool(row.get("first_proposal_matches")) for row in handoffs
-        ),
+        "requests_with_draft": requests,
+        "handoffs": handoff_count,
+        "handoff_rate": handoff_count / requests if requests else None,
+        "first_token_matches": first_matches,
         "first_token_match_rate": (
-            sum(bool(row.get("first_proposal_matches")) for row in handoffs) / requests
-            if requests
-            else None
+            first_matches / handoff_count if handoff_count else None
+        ),
+        "first_token_match_rate_per_request": (
+            first_matches / requests if requests else None
+        ),
+        "root_branch_covered": root_covered,
+        "root_branch_coverage_at_handoff": (
+            root_covered / handoff_count if handoff_count else None
+        ),
+        "root_branch_coverage_per_request": (
+            root_covered / requests if requests else None
         ),
         "injected_blocks": len(injections),
         "feedback_blocks": len(feedback),
