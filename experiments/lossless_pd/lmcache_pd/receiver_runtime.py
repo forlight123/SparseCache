@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 _TRACE_LOCK = threading.Lock()
 _INSTALLED = False
 
@@ -38,6 +37,8 @@ class ClaimedLayerViews:
 
     objects: list[Any]
     chunk_indices: tuple[int, ...]
+    token_ranges: tuple[tuple[int, int], ...]
+    prompt_tokens: int
     layers: tuple[int, ...]
     views: dict[int, list[Any]]
     _released: bool = False
@@ -138,6 +139,10 @@ def inspect_anchor_message(
         "seed_record": message.get("seed_record"),
         "remote_indexes": list(message.get("remote_indexes") or ()),
         "chunk_indices": list(message.get("chunk_indices") or ()),
+        "token_ranges": [
+            [int(start), int(end)] for start, end in (message.get("token_ranges") or ())
+        ],
+        "prompt_tokens": int(message.get("prompt_tokens", 0)),
         "objects": object_rows,
         "complete": (
             bool(requested_keys)
@@ -163,6 +168,11 @@ class AnchorMailbox:
         self.trace_path = trace_path
         self.lookup_timeout_ms = lookup_timeout_ms
         self.draft_layers = draft_layers
+        from experiments.lossless_pd.lmcache_pd.online_drafter import (
+            get_online_drafter,
+        )
+
+        self.online_drafter = get_online_drafter()
         self._condition = threading.Condition()
         self._records: dict[str, dict[str, Any]] = {}
         self._running = True
@@ -180,7 +190,7 @@ class AnchorMailbox:
         while self._running:
             try:
                 payload, _ = self._socket.recvfrom(65535)
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break
@@ -195,7 +205,11 @@ class AnchorMailbox:
                     if row["complete"] or time.perf_counter() >= deadline:
                         break
                     time.sleep(0.001)
-                if row["complete"] and self.draft_layers:
+                if (
+                    row["complete"]
+                    and self.draft_layers
+                    and self.online_drafter is None
+                ):
                     view_started_ns = time.perf_counter_ns()
                     claim = self._claim_record_layer_views(row, self.draft_layers)
                     if claim is not None:
@@ -227,7 +241,11 @@ class AnchorMailbox:
                             "inspection_ms": (view_finished_ns - view_started_ns) / 1e6,
                         }
                 self.publish(row)
-            except Exception as error:
+                if row["complete"] and self.online_drafter is not None:
+                    self.online_drafter.submit(self, row)
+            # UDP is an external control plane. A malformed notification must
+            # be traced without terminating the mailbox for subsequent work.
+            except Exception as error:  # noqa: BLE001
                 if self.trace_path:
                     _append_trace(
                         self.trace_path,
@@ -247,7 +265,9 @@ class AnchorMailbox:
         if self.trace_path:
             _append_trace(self.trace_path, row)
 
-    def wait(self, request_id: str, timeout: float | None = None) -> dict[str, Any] | None:
+    def wait(
+        self, request_id: str, timeout: float | None = None
+    ) -> dict[str, Any] | None:
         """Wait for an AnchorReady record without pinning or consuming its KV."""
 
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -299,7 +319,17 @@ class AnchorMailbox:
                     # no gather/copy is performed on the decoder critical path.
                     views[layer].append(tensor[:, layer : layer + 1, :, :])
             chunk_indices = tuple(record.get("chunk_indices") or range(len(objects)))
-            return ClaimedLayerViews(objects, chunk_indices, layers, views)
+            token_ranges = tuple(
+                (int(start), int(end)) for start, end in record.get("token_ranges", ())
+            )
+            return ClaimedLayerViews(
+                objects,
+                chunk_indices,
+                token_ranges,
+                int(record.get("prompt_tokens", 0)),
+                layers,
+                views,
+            )
         except BaseException:
             self.release_objects(objects)
             raise
@@ -324,6 +354,8 @@ class AnchorMailbox:
         self._running = False
         self._socket.close()
         self._thread.join(timeout=1)
+        if self.online_drafter is not None:
+            self.online_drafter.close()
 
 
 def install_receiver() -> None:

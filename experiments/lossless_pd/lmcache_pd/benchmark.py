@@ -12,11 +12,10 @@ import json
 import random
 import statistics
 import time
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 import requests
-import torch
 from transformers import AutoTokenizer
 
 from experiments.lossless_pd.reference_packets import load_packet, read_index
@@ -91,13 +90,10 @@ def stream_completion(
             continue
         event = json.loads(body)
         if "error" in event:
-            raise RuntimeError(
-                f"endpoint stream failed ({endpoint}): {event['error']}"
-            )
+            raise RuntimeError(f"endpoint stream failed ({endpoint}): {event['error']}")
         if "choices" not in event:
             raise RuntimeError(
-                f"endpoint stream returned an unexpected event ({endpoint}): "
-                f"{event}"
+                f"endpoint stream returned an unexpected event ({endpoint}): {event}"
             )
         text = event["choices"][0].get("text", "")
         if text and first is None:
@@ -126,7 +122,9 @@ def select_entries(entries: list[dict], count: int) -> list[dict]:
         return ordered
     if count == 1:
         return [ordered[len(ordered) // 2]]
-    positions = [round(index * (len(ordered) - 1) / (count - 1)) for index in range(count)]
+    positions = [
+        round(index * (len(ordered) - 1) / (count - 1)) for index in range(count)
+    ]
     return [ordered[position] for position in positions]
 
 
@@ -134,7 +132,9 @@ def run(args: argparse.Namespace) -> dict:
     packet_root = Path(args.packets).resolve()
     index = read_index(packet_root)
     entries = select_entries(index["entries"], args.num_requests)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    tokenizer = (
+        None if args.packet_token_ids else AutoTokenizer.from_pretrained(args.tokenizer)
+    )
     session = requests.Session()
     session.trust_env = False
 
@@ -142,8 +142,13 @@ def run(args: argparse.Namespace) -> dict:
     for ordinal, entry in enumerate(entries):
         packet = load_packet(packet_root, entry)
         ids = packet["prompt_ids"][0, : args.max_input_tokens].tolist()
-        prompt = tokenizer.decode(ids, skip_special_tokens=False)
-        retokenized = len(tokenizer.encode(prompt, add_special_tokens=False))
+        if args.packet_token_ids:
+            prompt = ids
+            retokenized = len(ids)
+        else:
+            assert tokenizer is not None
+            prompt = tokenizer.decode(ids, skip_special_tokens=False)
+            retokenized = len(tokenizer.encode(prompt, add_special_tokens=False))
         payload = {
             "model": args.model,
             "prompt": prompt,
@@ -200,6 +205,7 @@ def run(args: argparse.Namespace) -> dict:
         "monolithic_url": args.monolithic_url,
         "max_input_tokens": args.max_input_tokens,
         "max_new_tokens": args.max_new_tokens,
+        "packet_token_ids": args.packet_token_ids,
         "summary": summarize(rows),
         "rows": rows,
     }
@@ -214,15 +220,18 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--tokenizer", default="/data/models/qwen/Qwen3-8B")
     parser.add_argument("--model", default="/data/models/qwen/Qwen3-8B")
-    parser.add_argument(
-        "--pd-url", default="http://127.0.0.1:19100/v1/completions"
-    )
+    parser.add_argument("--pd-url", default="http://127.0.0.1:19100/v1/completions")
     parser.add_argument(
         "--monolithic-url", default="http://127.0.0.1:17350/v1/completions"
     )
     parser.add_argument("--num-requests", type=int, default=16)
     parser.add_argument("--max-input-tokens", type=int, default=7800)
     parser.add_argument("--max-new-tokens", type=int, default=8)
+    parser.add_argument(
+        "--packet-token-ids",
+        action="store_true",
+        help="submit immutable packet token IDs directly without text round-trip",
+    )
     parser.add_argument("--timeout", type=float, default=120.0)
     args = parser.parse_args()
     if min(args.num_requests, args.max_input_tokens, args.max_new_tokens) <= 0:

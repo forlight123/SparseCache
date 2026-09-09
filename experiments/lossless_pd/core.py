@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import random
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -17,8 +18,25 @@ from experiments.blockdraft.model import BlockKVDraft, build_packed_attention_ma
 from experiments.kvshot.model import KVShotDraft
 
 
-def page_order(tokens: int, page_size: int, mode: str, seed: int,
-               scores: torch.Tensor | None = None) -> list[int]:
+@dataclass(frozen=True)
+class PreparedRerankBlock:
+    """Expensive sparse-KV state reusable after the first Target token arrives."""
+
+    selected: torch.Tensor
+    base_scores: torch.Tensor
+    candidate_ids: torch.Tensor
+    recurrent: torch.Tensor
+    recurrent_state: torch.Tensor
+    length: int
+
+
+def page_order(
+    tokens: int,
+    page_size: int,
+    mode: str,
+    seed: int,
+    scores: torch.Tensor | None = None,
+) -> list[int]:
     if tokens <= 0 or page_size <= 0:
         raise ValueError("token count and page size must be positive")
     count = math.ceil(tokens / page_size)
@@ -36,26 +54,30 @@ def page_order(tokens: int, page_size: int, mode: str, seed: int,
     return protected + rest
 
 
-def visible_positions(tokens: int, page_size: int, fraction: float,
-                      order: list[int], device: torch.device) -> torch.Tensor:
+def visible_positions(
+    tokens: int, page_size: int, fraction: float, order: list[int], device: torch.device
+) -> torch.Tensor:
     if not 0 < fraction <= 1:
         raise ValueError("fraction must be in (0,1]")
     count = math.ceil(tokens / page_size)
     if sorted(order) != list(range(count)):
         raise ValueError("page order must be a permutation")
     n = min(count, max(min(count, 2), math.ceil(fraction * count)))
-    selected = [t for p in order[:n]
-                for t in range(p * page_size, min(tokens, (p + 1) * page_size))]
+    selected = [
+        t
+        for p in order[:n]
+        for t in range(p * page_size, min(tokens, (p + 1) * page_size))
+    ]
     return torch.tensor(sorted(selected), device=device, dtype=torch.long)
 
 
 class ProgressiveBlock(nn.Module):
     """Physically compact KV inputs with original positions and a stage signal.
 
-Every output position is an independent categorical proposal conditioned on
-the known seed and this view. MASK positions never contain future labels.
-There is no sampling/refinement/commit logic in this model component.
-"""
+    Every output position is an independent categorical proposal conditioned on
+    the known seed and this view. MASK positions never contain future labels.
+    There is no sampling/refinement/commit logic in this model component.
+    """
 
     def __init__(self, base: BlockKVDraft):
         super().__init__()
@@ -65,14 +87,17 @@ There is no sampling/refinement/commit logic in this model component.
         self.stage = nn.Linear(2, base.config.hidden_size, bias=False)
         nn.init.zeros_(self.stage.weight)
 
-    def sparse_hidden(self, seed, embedding, keys, values, positions,
-                      prompt_length: int):
+    def sparse_hidden(
+        self, seed, embedding, keys, values, positions, prompt_length: int
+    ):
         if keys.shape != values.shape or keys.ndim != 5:
             raise ValueError("KV must have matching [B,L,H,T,D] shapes")
         if positions.ndim != 1 or positions.numel() != keys.shape[-2]:
             raise ValueError("one original position is required per physical KV token")
-        if positions.numel() == 0 or bool((positions < 0).any()) or bool(
-            (positions >= prompt_length).any()
+        if (
+            positions.numel() == 0
+            or bool((positions < 0).any())
+            or bool((positions >= prompt_length).any())
         ):
             raise ValueError("missing/future/current seed KV must not be supplied")
         if positions.unique().numel() != positions.numel():
@@ -91,38 +116,65 @@ There is no sampling/refinement/commit logic in this model component.
         )
         hidden = torch.cat((current, masks), dim=1)
         missing = 1 - positions.numel() / prompt_length
-        stage_input = hidden.new_tensor([
-            missing, missing * math.log1p(prompt_length) / math.log1p(131072)
-        ])
+        stage_input = hidden.new_tensor(
+            [missing, missing * math.log1p(prompt_length) / math.log1p(131072)]
+        )
         hidden = hidden + self.stage(stage_input).view(1, 1, -1)
         query_positions = torch.arange(
             prompt_length, prompt_length + config.block_size, device=keys.device
         )[None].expand(batch, -1)
-        compact_lengths = torch.full((batch, 1), positions.numel(),
-                                     device=keys.device, dtype=torch.long)
-        mask = build_packed_attention_mask(
-            compact_lengths, context_length=positions.numel(),
-            block_size=config.block_size, causal_block=config.causal_block
+        compact_lengths = torch.full(
+            (batch, 1), positions.numel(), device=keys.device, dtype=torch.long
         )
-        for layer, key, value in zip(self.base.layers,
-                                     memory_k.unbind(1), memory_v.unbind(1)):
+        mask = build_packed_attention_mask(
+            compact_lengths,
+            context_length=positions.numel(),
+            block_size=config.block_size,
+            causal_block=config.causal_block,
+        )
+        for layer, key, value in zip(
+            self.base.layers, memory_k.unbind(1), memory_v.unbind(1)
+        ):
             hidden = layer(hidden, key, value, query_positions, compact_lengths, mask)
         hidden = self.base.final_norm(hidden)
         return hidden[:, :-1] if config.shift_labels else hidden[:, 1:]
 
-    def forward(self, seed, embedding, lm_head, keys, values, positions,
-                prompt_length: int, previous_tokens: torch.Tensor | None = None):
+    def forward(
+        self,
+        seed,
+        embedding,
+        lm_head,
+        keys,
+        values,
+        positions,
+        prompt_length: int,
+        previous_tokens: torch.Tensor | None = None,
+    ):
         """Teacher-forced logits; causal correction sees only preceding tokens."""
 
         base_logits, correction = self.forward_components(
-            seed, embedding, lm_head, keys, values, positions, prompt_length,
+            seed,
+            embedding,
+            lm_head,
+            keys,
+            values,
+            positions,
+            prompt_length,
             previous_tokens=previous_tokens,
         )
         return base_logits + correction
 
-    def forward_components(self, seed, embedding, lm_head, keys, values, positions,
-                           prompt_length: int,
-                           previous_tokens: torch.Tensor | None = None):
+    def forward_components(
+        self,
+        seed,
+        embedding,
+        lm_head,
+        keys,
+        values,
+        positions,
+        prompt_length: int,
+        previous_tokens: torch.Tensor | None = None,
+    ):
         """Expose frozen base and causal residual logits for constrained training."""
 
         selected = self.sparse_hidden(
@@ -140,7 +192,7 @@ There is no sampling/refinement/commit logic in this model component.
             raise ValueError(
                 "causal correction needs a nonempty [seed, y0, ...] prefix"
             )
-        selected = selected[:, :previous_tokens.shape[1]]
+        selected = selected[:, : previous_tokens.shape[1]]
         base_logits = lm_head(selected)
         if self.base.config.correction_mode != "vocab":
             raise ValueError("rerank correction uses teacher_forced_rerank")
@@ -148,12 +200,23 @@ There is no sampling/refinement/commit logic in this model component.
         correction = self.base.correction_head(torch.cat((selected, recurrent), dim=-1))
         return base_logits, correction
 
-    def teacher_forced_rerank(self, seed, embedding, lm_head, keys, values,
-                              positions, prompt_length: int,
-                              previous_tokens: torch.Tensor):
+    def teacher_forced_rerank(
+        self,
+        seed,
+        embedding,
+        lm_head,
+        keys,
+        values,
+        positions,
+        prompt_length: int,
+        previous_tokens: torch.Tensor,
+    ):
         """Return fixed base candidates and causal residual scores."""
 
-        if self.base.correction_gru is None or self.base.config.correction_mode != "rerank":
+        if (
+            self.base.correction_gru is None
+            or self.base.config.correction_mode != "rerank"
+        ):
             raise ValueError("checkpoint does not contain a rerank correction head")
         selected = self.sparse_hidden(
             seed, embedding, keys, values, positions, prompt_length
@@ -164,7 +227,7 @@ There is no sampling/refinement/commit logic in this model component.
             or not 0 < previous_tokens.shape[1] <= selected.shape[1]
         ):
             raise ValueError("rerank needs a nonempty [seed, y0, ...] prefix")
-        selected = selected[:, :previous_tokens.shape[1]]
+        selected = selected[:, : previous_tokens.shape[1]]
         base_logits = lm_head(selected)
         base_scores, candidate_ids = base_logits.topk(
             self.base.config.correction_topk, dim=-1
@@ -180,9 +243,132 @@ There is no sampling/refinement/commit logic in this model component.
         return candidate_ids, base_scores, correction_scores
 
     @torch.no_grad()
-    def propose(self, seed, embedding, lm_head, keys, values, positions,
-                prompt_length: int, length: int | None = None):
+    def prepare_rerank_block(
+        self,
+        seed,
+        embedding,
+        lm_head,
+        keys,
+        values,
+        positions,
+        prompt_length: int,
+        length: int | None = None,
+    ) -> PreparedRerankBlock:
+        """Precompute all sparse-KV work before the authoritative token exists."""
+
+        if (
+            self.base.correction_gru is None
+            or self.base.config.correction_mode != "rerank"
+        ):
+            raise ValueError("Target-token repair requires a causal rerank checkpoint")
+        selected = self.sparse_hidden(
+            seed, embedding, keys, values, positions, prompt_length
+        )
+        length = selected.shape[1] if length is None else length
+        if not 0 < length <= selected.shape[1]:
+            raise ValueError("proposal length exceeds the configured block")
+        base_logits = lm_head(selected[:, :length])
+        base_scores, candidate_ids = base_logits.topk(
+            self.base.config.correction_topk, dim=-1
+        )
+        recurrent, recurrent_state = self.base.correction_gru(embedding(seed))
+        return PreparedRerankBlock(
+            selected[:, :length],
+            base_scores,
+            candidate_ids,
+            recurrent,
+            recurrent_state,
+            length,
+        )
+
+    @torch.no_grad()
+    def propose_prepared_rerank(
+        self,
+        prepared: PreparedRerankBlock,
+        embedding,
+        lm_head,
+        *,
+        first_target_token: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Decode a cached block, optionally repairing its suffix from Target t1."""
+
+        if (
+            self.base.correction_gru is None
+            or self.base.config.correction_mode != "rerank"
+        ):
+            raise ValueError("prepared reranking requires a causal rerank checkpoint")
+        if first_target_token is None:
+            start = 0
+            recurrent = prepared.recurrent
+            state = prepared.recurrent_state
+        else:
+            if first_target_token.ndim != 2 or first_target_token.shape != (
+                prepared.selected.shape[0],
+                1,
+            ):
+                raise ValueError("first Target token must have shape [batch,1]")
+            start = 1
+            recurrent, state = self.base.correction_gru(
+                embedding(first_target_token), prepared.recurrent_state
+            )
+        proposals = []
+        for position in range(start, prepared.length):
+            if position > start:
+                recurrent, state = self.base.correction_gru(
+                    embedding(proposals[-1]), state
+                )
+            correction = self.base.correction_head(
+                torch.cat(
+                    (prepared.selected[:, position : position + 1], recurrent),
+                    dim=-1,
+                )
+            )
+            weights = F.embedding(
+                prepared.candidate_ids[:, position : position + 1],
+                lm_head.weight,
+            )
+            residual = torch.einsum("bqh,bqkh->bqk", correction, weights)
+            choice = (
+                prepared.base_scores[:, position : position + 1] + residual
+            ).argmax(-1)
+            proposals.append(
+                prepared.candidate_ids[:, position : position + 1]
+                .gather(-1, choice.unsqueeze(-1))
+                .squeeze(-1)
+            )
+        if not proposals:
+            return prepared.candidate_ids.new_empty((prepared.selected.shape[0], 0))
+        return torch.cat(proposals, dim=1)
+
+    @torch.no_grad()
+    def propose(
+        self,
+        seed,
+        embedding,
+        lm_head,
+        keys,
+        values,
+        positions,
+        prompt_length: int,
+        length: int | None = None,
+    ):
         """Autoregressive causal head over one parallel sparse-KV block pass."""
+
+        if (
+            self.base.correction_gru is not None
+            and self.base.config.correction_mode == "rerank"
+        ):
+            prepared = self.prepare_rerank_block(
+                seed,
+                embedding,
+                lm_head,
+                keys,
+                values,
+                positions,
+                prompt_length,
+                length,
+            )
+            return self.propose_prepared_rerank(prepared, embedding, lm_head)
 
         selected = self.sparse_hidden(
             seed, embedding, keys, values, positions, prompt_length
@@ -195,48 +381,47 @@ There is no sampling/refinement/commit logic in this model component.
             return base_logits.argmax(-1)
         proposals = []
         recurrent, state = self.base.correction_gru(embedding(seed))
-        if self.base.config.correction_mode == "rerank":
-            base_scores, candidate_ids = base_logits.topk(
-                self.base.config.correction_topk, dim=-1
-            )
         for position in range(length):
             if position:
                 recurrent, state = self.base.correction_gru(
                     embedding(proposals[-1]), state
                 )
-            correction = self.base.correction_head(torch.cat((
-                selected[:, position:position + 1], recurrent
-            ), dim=-1))
-            if self.base.config.correction_mode == "rerank":
-                weights = F.embedding(candidate_ids[:, position:position + 1],
-                                      lm_head.weight)
-                residual = torch.einsum("bqh,bqkh->bqk", correction, weights)
-                choice = (base_scores[:, position:position + 1] + residual).argmax(-1)
-                proposals.append(
-                    candidate_ids[:, position:position + 1]
-                    .gather(-1, choice.unsqueeze(-1)).squeeze(-1)
-                )
-            else:
-                proposals.append(
-                    (base_logits[:, position:position + 1] + correction).argmax(-1)
-                )
+            correction = self.base.correction_head(
+                torch.cat((selected[:, position : position + 1], recurrent), dim=-1)
+            )
+            proposals.append(
+                (base_logits[:, position : position + 1] + correction).argmax(-1)
+            )
         return torch.cat(proposals, dim=1)
 
 
-def kvshot_pd_propose(model: KVShotDraft, seed, embedding, keys, values,
-                     positions, prompt_length: int, length: int):
+def kvshot_pd_propose(
+    model: KVShotDraft,
+    seed,
+    embedding,
+    keys,
+    values,
+    positions,
+    prompt_length: int,
+    length: int,
+):
     """Adapt the imported AR reference to the same P-side seed protocol.
 
-Prompt KV excludes the seed. Every seed/draft representation is generated by
-the drafter, never borrowed from a target forward that D could not yet run.
-"""
-    prefixes = [layer.project_prefix(keys, values, positions[None])
-                for layer in model.layers]
+    Prompt KV excludes the seed. Every seed/draft representation is generated by
+    the drafter, never borrowed from a target forward that D could not yet run.
+    """
+    prefixes = [
+        layer.project_prefix(keys, values, positions[None]) for layer in model.layers
+    ]
     memories = [None] * len(model.layers)
     token, proposals = seed, []
     for step in range(length):
         logits, memories = model.step(
-            token, embedding, prefixes, memories, prompt_length + step,
+            token,
+            embedding,
+            prefixes,
+            memories,
+            prompt_length + step,
             prefix_has_current_token=False,
         )
         token = model.draft_to_target[logits[:, -1].argmax(-1), None]
@@ -288,9 +473,9 @@ def attention_value(state):
 def fixed_query_bound(query, key, value, positions, page_size: int):
     """Conservative center/radius page bound for a fixed exact query.
 
-This is a mathematical FP64 diagnostic, not outward-rounded certification.
-It includes all KV metadata at P. No omission is hidden from the bound.
-"""
+    This is a mathematical FP64 diagnostic, not outward-rounded certification.
+    It includes all KV metadata at P. No omission is hidden from the bound.
+    """
     q = query.double()
     k, v = expand_gqa(key.double(), q.shape[1]), expand_gqa(value.double(), q.shape[1])
     scores = q @ k.transpose(-1, -2) / math.sqrt(q.shape[-1])
@@ -328,6 +513,10 @@ It includes all KV metadata at P. No omission is hidden from the bound.
         "mean_missing_mass": float(rho_actual.mean()),
         "mean_missing_mass_upper": float(rho_upper.mean()),
         "bound_violations_fp64_tolerance_1e_9": int((error > bound + 1e-9).sum()),
-        "mass_violations_fp64_tolerance_1e_9": int((rho_actual > rho_upper + 1e-9).sum()),
-        "mean_bound_over_output_norm": float((bound / full.norm(dim=-1).clamp_min(1e-12)).mean()),
+        "mass_violations_fp64_tolerance_1e_9": int(
+            (rho_actual > rho_upper + 1e-9).sum()
+        ),
+        "mean_bound_over_output_norm": float(
+            (bound / full.norm(dim=-1).clamp_min(1e-12)).mean()
+        ),
     }

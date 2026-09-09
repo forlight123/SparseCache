@@ -2,11 +2,11 @@
 
 > Cloud training handoff: read [TRAIN.md](TRAIN.md) before spending GPU time.
 > The current model path is a direct Target-KV block drafter plus a causal
-> hidden-space top-64 reranker; EAGLE expansion has been stopped. The latest
-> real LMCache 1P1D gate exposes a roughly 108-ms AnchorReady--FullReady window
-> at 7.8K tokens. The decoder now resolves every Anchor CUDA object and exposes
-> zero-copy views of the five drafter layers while remaining 64/64 identical to
-> the authoritative full-KV P/D output.
+> hidden-space top-64 reranker; EAGLE expansion has been stopped. The direct
+> drafter now runs online from real LMCache Anchor buffers while Residual KV is
+> in flight. On 64 exact-token QMSum requests, full-KV verification preserves
+> 64/64 monolithic outputs and reduces total latency by 24.41 ms versus an
+> observe-only sandwich control (95% CI [19.51, 29.67] ms saved).
 
 SparseCache is a reference framework for reusable RAG document KV. The current
 benchmark evaluates CacheBlend on its MuSiQue subset under a strict
@@ -46,6 +46,8 @@ when reproducing the systems experiments below.
 
 The current lossless P/D algorithm and the real LMCache gate are documented in
 [`docs/ICLR2027_ALGORITHM.md`](docs/ICLR2027_ALGORITHM.md) and
+[`docs/ICLR2027_ONLINE_LMCACHE_RESULT_20260909.md`](docs/ICLR2027_ONLINE_LMCACHE_RESULT_20260909.md).
+The earlier receiver-only milestone remains in
 [`docs/ICLR2027_LMCACHE_SYSTEM_GATE_20260909.md`](docs/ICLR2027_LMCACHE_SYSTEM_GATE_20260909.md).
 
 The copied CacheBlend tree has its own uv environment and no longer depends

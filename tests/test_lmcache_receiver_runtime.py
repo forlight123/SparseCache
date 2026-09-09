@@ -6,8 +6,8 @@ import torch
 from experiments.lossless_pd.lmcache_pd.receiver_runtime import (
     AnchorMailbox,
     inspect_anchor_message,
-    parse_udp_endpoint,
     parse_layers,
+    parse_udp_endpoint,
 )
 
 
@@ -80,6 +80,8 @@ def notification():
         "resident_bytes": 30,
         "remote_indexes": [100, 200],
         "chunk_indices": [3, 11],
+        "token_ranges": [[768, 1024], [2816, 3072]],
+        "prompt_tokens": 4096,
         "seed_record": {"seed_token_id": 42, "seed_sampled_ns": 1},
     }
 
@@ -109,6 +111,8 @@ def test_inspect_anchor_resolves_real_backend_objects_and_bytes():
     assert row["written_bytes"] == 30
     assert row["pd_tracked_keys"] == 2
     assert row["device"] == "cuda:0"
+    assert row["token_ranges"] == [[768, 1024], [2816, 3072]]
+    assert row["prompt_tokens"] == 4096
     assert [obj["address"] for obj in row["objects"]] == [100, 200]
 
 
@@ -168,11 +172,18 @@ def test_mailbox_exposes_ordered_zero_copy_layer_views():
     claim = mailbox.claim_layer_views("external-7", (1, 9, 17, 25, 33))
     assert claim is not None
     assert claim.chunk_indices == (3, 11)
+    assert claim.token_ranges == ((768, 1024), (2816, 3072))
+    assert claim.prompt_tokens == 4096
     assert set(claim.views) == {1, 9, 17, 25, 33}
     assert all(len(views) == 2 for views in claim.views.values())
-    assert all(view.shape == (2, 1, 256, 4) for views in claim.views.values() for view in views)
+    assert all(
+        view.shape == (2, 1, 256, 4) for views in claim.views.values() for view in views
+    )
     for views in claim.views.values():
         for view, owner in zip(views, claim.objects, strict=True):
-            assert view.untyped_storage().data_ptr() == owner.tensor.untyped_storage().data_ptr()
+            assert (
+                view.untyped_storage().data_ptr()
+                == owner.tensor.untyped_storage().data_ptr()
+            )
     claim.release()
     assert all(obj.get_ref_count() == 1 for obj in claim.objects)

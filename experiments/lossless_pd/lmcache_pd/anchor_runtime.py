@@ -21,10 +21,10 @@ import socket
 import threading
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import is_dataclass, replace
 from pathlib import Path
-from typing import Any, Sequence
-
+from typing import Any
 
 _REQUEST_ID = contextvars.ContextVar("sparsecache_request_id", default="")
 _PD_REQUEST_ID = contextvars.ContextVar("sparsecache_pd_request_id", default="")
@@ -35,6 +35,8 @@ _TRANSFER_KEY_BYTES = contextvars.ContextVar(
     "sparsecache_transfer_key_bytes", default=()
 )
 _TRANSFER_INDICES = contextvars.ContextVar("sparsecache_transfer_indices", default=())
+_TRANSFER_RANGES = contextvars.ContextVar("sparsecache_transfer_ranges", default=())
+_PROMPT_TOKENS = contextvars.ContextVar("sparsecache_prompt_tokens", default=0)
 _TRACE_LOCK = threading.Lock()
 _SEED_LOCK = threading.Lock()
 _PENDING_SEEDS: deque[dict] = deque()
@@ -49,6 +51,17 @@ def anchor_indices(num_chunks: int, fraction: float, mode: str) -> list[int]:
     count = min(num_chunks, max(1, math.ceil(num_chunks * fraction)))
     if mode == "prefix":
         return list(range(count))
+    if mode == "protected_uniform":
+        # The direct-KV drafter was trained with the first and last page always
+        # present.  Preserve that contract while spreading the remaining
+        # budget uniformly over the interior.  For tiny fractions this may
+        # deliberately raise a one-chunk budget to two chunks.
+        count = min(num_chunks, max(min(num_chunks, 2), count))
+        if count == 1:
+            return [0]
+        return sorted(
+            round(index * (num_chunks - 1) / (count - 1)) for index in range(count)
+        )
     if mode != "uniform":
         raise ValueError(f"unsupported anchor selection mode: {mode}")
     # Midpoints of equal-width bins are unique whenever count <= num_chunks.
@@ -124,6 +137,8 @@ def _phase_spec(
     request_id: str = "",
     seed_record: dict | None = None,
     indices: Sequence[int] = (),
+    token_ranges: Sequence[tuple[int, int]] = (),
+    prompt_tokens: int = 0,
 ):
     """Clone a mutable LMCache DisaggSpec before asynchronous submission."""
 
@@ -144,16 +159,17 @@ def _phase_spec(
     result._sparsecache_request_id = request_id
     result._sparsecache_seed_record = seed_record
     result._sparsecache_indices = tuple(int(index) for index in indices)
+    result._sparsecache_token_ranges = tuple(
+        (int(start), int(end)) for start, end in token_ranges
+    )
+    result._sparsecache_prompt_tokens = int(prompt_tokens)
     return result
 
 
-def _install_gather_first_store(
-    *, fraction: float, mode: str, trace_path: str
-) -> None:
+def _install_gather_first_store(*, fraction: float, mode: str, trace_path: str) -> None:
     """Patch LMCacheEngine.store to submit anchor chunks before residual gather."""
 
     import torch
-
     from lmcache.v1.cache_engine import LMCacheEngine
 
     original_store = LMCacheEngine.store
@@ -237,9 +253,7 @@ def _install_gather_first_store(
         if not memory_objs:
             return None
 
-        anchor_ids, residual_ids = partition_indices(
-            len(memory_objs), fraction, mode
-        )
+        anchor_ids, residual_ids = partition_indices(len(memory_objs), fraction, mode)
         phases = [("anchor", anchor_ids)]
         if residual_ids:
             phases.append(("residual", residual_ids))
@@ -267,6 +281,8 @@ def _install_gather_first_store(
                 request_id=req_id,
                 seed_record=seed_record,
                 indices=indexes,
+                token_ranges=_subset(list(zip(starts, ends, strict=True)), indexes),
+                prompt_tokens=len(tokens),
             )
             with store_stats.profile_put():
                 self.storage_manager.batched_put(
@@ -357,6 +373,8 @@ def install() -> None:
         phase = getattr(transfer_spec, "_sparsecache_phase", "")
         seed_record = getattr(transfer_spec, "_sparsecache_seed_record", None)
         indices = getattr(transfer_spec, "_sparsecache_indices", ())
+        token_ranges = getattr(transfer_spec, "_sparsecache_token_ranges", ())
+        prompt_tokens = getattr(transfer_spec, "_sparsecache_prompt_tokens", 0)
         request_token = _REQUEST_ID.set(request_id)
         pd_request_token = _PD_REQUEST_ID.set(pd_request_id)
         phase_token = _TRANSFER_PHASE.set(phase)
@@ -364,9 +382,13 @@ def install() -> None:
         keys_token = _TRANSFER_KEYS.set(key_strings)
         key_bytes_token = _TRANSFER_KEY_BYTES.set(key_bytes)
         indices_token = _TRANSFER_INDICES.set(indices)
+        ranges_token = _TRANSFER_RANGES.set(token_ranges)
+        prompt_tokens_token = _PROMPT_TOKENS.set(prompt_tokens)
         try:
             return await original_task(self, *args, **kwargs)
         finally:
+            _PROMPT_TOKENS.reset(prompt_tokens_token)
+            _TRANSFER_RANGES.reset(ranges_token)
             _TRANSFER_INDICES.reset(indices_token)
             _TRANSFER_KEY_BYTES.reset(key_bytes_token)
             _TRANSFER_KEYS.reset(keys_token)
@@ -390,13 +412,13 @@ def install() -> None:
                 "bytes": total_bytes,
                 "keys": list(_TRANSFER_KEYS.get()),
                 "chunk_indices": list(_TRANSFER_INDICES.get()),
+                "token_ranges": [list(item) for item in _TRANSFER_RANGES.get()],
+                "prompt_tokens": _PROMPT_TOKENS.get(),
                 # ``bytes`` counts actual NIXL writes. ``resident_bytes`` also
                 # includes deduplicated keys that were already on the receiver
                 # and is therefore the correct mailbox-readiness invariant.
                 "resident_bytes": sum(_TRANSFER_KEY_BYTES.get()),
-                "remote_indexes": list(
-                    (transfer_spec or {}).get("remote_indexes", ())
-                ),
+                "remote_indexes": list((transfer_spec or {}).get("remote_indexes", ())),
                 "started_ns": started_ns,
                 "finished_ns": finished_ns,
                 "write_ms": (finished_ns - started_ns) / 1e6,
@@ -417,7 +439,9 @@ def install() -> None:
         ]
         residual = [obj for index, obj in enumerate(objects) if index not in selected]
         residual_remote = [
-            remote for index, remote in enumerate(remote_indexes) if index not in selected
+            remote
+            for index, remote in enumerate(remote_indexes)
+            if index not in selected
         ]
         started = time.perf_counter()
         await original_write(

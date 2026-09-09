@@ -1,6 +1,6 @@
-import pytest
-
 from dataclasses import dataclass
+
+import pytest
 
 from experiments.lossless_pd.lmcache_pd.anchor_runtime import (
     _claim_seed,
@@ -19,6 +19,12 @@ def test_uniform_anchor_indices_cover_requested_fraction_without_duplicates():
 
 def test_prefix_anchor_indices_are_contiguous():
     assert anchor_indices(10, 0.2, "prefix") == [0, 1]
+
+
+def test_protected_uniform_preserves_boundary_chunks_and_spreads_budget():
+    assert anchor_indices(31, 0.1, "protected_uniform") == [0, 10, 20, 30]
+    assert anchor_indices(11, 0.01, "protected_uniform") == [0, 10]
+    assert anchor_indices(1, 0.01, "protected_uniform") == [0]
 
 
 @pytest.mark.parametrize("fraction", [0, -0.1, 1.1])
@@ -56,6 +62,8 @@ def test_phase_specs_are_cloned_and_preserve_total_request_chunks():
         request_id="external-1",
         seed_record={"seed_token_id": 42},
         indices=[3, 11, 19, 27],
+        token_ranges=[(768, 1024), (2816, 3072), (4864, 5120), (6912, 7168)],
+        prompt_tokens=7800,
     )
     residual = _phase_spec(
         original,
@@ -73,6 +81,13 @@ def test_phase_specs_are_cloned_and_preserve_total_request_chunks():
     assert anchor._sparsecache_request_id == "external-1"
     assert anchor._sparsecache_seed_record == {"seed_token_id": 42}
     assert anchor._sparsecache_indices == (3, 11, 19, 27)
+    assert anchor._sparsecache_token_ranges == (
+        (768, 1024),
+        (2816, 3072),
+        (4864, 5120),
+        (6912, 7168),
+    )
+    assert anchor._sparsecache_prompt_tokens == 7800
 
 
 def test_seed_queue_preserves_batch_order():

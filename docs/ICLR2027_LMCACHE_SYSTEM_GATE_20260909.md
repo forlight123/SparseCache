@@ -2,6 +2,12 @@
 
 Date: 2026-09-09
 
+> This document freezes the receiver-only milestone. The previously open online
+> draft/verification gate has since passed; see
+> [ICLR2027_ONLINE_LMCACHE_RESULT_20260909.md](ICLR2027_ONLINE_LMCACHE_RESULT_20260909.md).
+> Numbers below intentionally retain the earlier 7,800-token text-replay
+> protocol and must not replace the later strict token-ID result.
+
 ## Outcome
 
 The real LMCache/vLLM deployment now delivers the early Anchor into the decoder

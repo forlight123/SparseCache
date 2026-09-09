@@ -291,15 +291,66 @@ storage. All 244 advertised objects and 9,210,691,584 resident bytes resolve.
 The complete receiver control path costs 0.911 ms on average while the 7.8K
 AnchorReady--FullReady window is 107.968 ms.
 
-Correctness is evaluated against a correctly hashed upstream full-KV P/D run.
-The progressive path matches it for 64/64 requests. Both variants differ from
-monolithic vLLM on the same 5/64 greedy requests, so those differences are a
-full-P/D execution-shape effect rather than progressive-KV drift. This also
-fixes the reproduction contract: `PYTHONHASHSEED=0`, P=`kv_producer`, and
-D=`kv_consumer` are mandatory. A missing hash seed can silently turn a supposed
+The integration now consumes `ClaimedLayerViews` in the trained direct-KV block
+drafter on a private D-side CUDA stream while Residual movement continues. Exact
+token ranges and the original prompt length accompany the objects, preventing
+the live runtime from silently evaluating a different sparse position map than
+the frozen training packet. `PYTHONHASHSEED=0`, P=`kv_producer`, and
+D=`kv_consumer` remain mandatory; a missing hash seed can turn a supposed
 KV-reuse test into decoder recomputation.
 
-The next code boundary is now narrow: consume `ClaimedLayerViews` in the trained
-block drafter, seal its proposal epoch before FullReady, and verify only after
-the authoritative target cache is complete. The current result proves data
-availability and zero-copy layout, not concurrent draft speedup.
+Strict evaluation submits immutable packet token IDs directly and preserves the
+native prompt length. This supersedes the earlier text-round-trip observation:
+observe, inject, and monolithic paths now agree on 64/64 greedy outputs. The
+earlier five discrepancies came from token/text protocol and boundary changes,
+not from progressive KV.
+
+## 10. Target-conditioned suffix repair
+
+The first online implementation admitted a block only if its first sparse-KV
+proposal matched the first authoritative D-side Target token. That gate wastes
+all overlapped long-context work on a first-token mismatch. The corrected
+factorization computes the expensive state before FullReady:
+
+```text
+Z(A,s) = H_sparse(A,s)
+       + TopK(W H_sparse)
+       + GRUState(s),
+```
+
+where `A` is the arrived Anchor and `s` is the exact P seed. When the full Target
+produces `t1`, the reranker advances the cached state with `t1` and produces
+only `q2..qg`. Thus sparse attention and the parallel vocabulary projection
+remain overlapped; only the small causal top-K repair follows `t1`.
+
+For greedy decoding, let the full-KV verifier accept the longest suffix prefix
+whose tokens equal its own transitions from the authoritative state after
+`t1`, and let it supply the first mismatch or bonus token. By induction over the
+accepted positions, every committed token equals sequential full-KV Target
+decoding. The proposal may be arbitrary and the conditioning changes only its
+acceptance rate. There is still no early commitment and no verifier drift.
+
+This gives a useful separation:
+
+```text
+information arrival controls proposal readiness;
+full-KV Target state controls commitment.
+```
+
+The current runtime contract is greedy only. Distributional losslessness under
+sampling additionally requires the repaired proposal probabilities and an exact
+sampling-aware acceptance/rejection rule.
+
+On 64 native-length frozen QMSum packets, the nominal 10% protected whole-chunk
+Anchor exposes 12.557% of tokens on average. Raw first-token agreement is
+84.375%. Target-conditioned blocks are submitted for all 64 requests and the
+full verifier accepts 2.438 tokens per request, including 1.438 useful suffix
+tokens beyond `t1`. Hot sparse precomputation takes 24.860 ms and repair takes
+3.035 ms on GPU.
+
+A fresh-server observe--inject--observe sandwich keeps the complete online
+draft/repair cost in both treatment and controls. Injection leaves TTFT
+unchanged (-0.635 ms, 95% CI [-1.579,+0.353]) and reduces total latency by
+24.407 ms (95% CI [19.513,29.671] ms saved), with 63/64 requests faster and
+64/64 outputs equal to monolithic. The fixed system result and its limitations
+are in `ICLR2027_ONLINE_LMCACHE_RESULT_20260909.md`.

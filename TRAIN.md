@@ -11,7 +11,7 @@
 Do not launch any EAGLE job in this file. The executable method and evidence are
 documented in [ICLR2027_ALGORITHM.md](docs/ICLR2027_ALGORITHM.md),
 [ICLR2027_LOSSLESS_EXPLORATION.md](docs/ICLR2027_LOSSLESS_EXPLORATION.md), and
-[ICLR2027_PILOT_REPORT_20260909.md](docs/ICLR2027_PILOT_REPORT_20260909.md).
+[ICLR2027_ONLINE_LMCACHE_RESULT_20260909.md](docs/ICLR2027_ONLINE_LMCACHE_RESULT_20260909.md).
 
 The inherited five-layer direct-KV block accepts 1.531 target tokens at the 10%
 priority view on 64 frozen long-prompt requests. A top-64 hidden-space causal
@@ -45,17 +45,25 @@ have 95% CIs [0.453,1.125], [1.672,2.078], and [3.219,3.875]. Its clean
 first-commit delta. These tasks occur in mechanism-training data, so the result
 is held-out-document evidence, not a final paper generalization claim.
 
-The real LMCache 1P1D gate now gathers and transfers a 12.903% whole-chunk
-Anchor before the residual. On 56 steady 7.8K prompts it exposes a 109.250-ms
-AnchorReady--FullReady interval (95% CI [109.139,109.366]); the observed
-`g=7` drafter maximum of 19.547 ms fits comfortably, although those timings are
-not yet from one concurrent process. A zero-proposal vLLM lifecycle hook also
-makes the exact online P seed available before store and binds it to the same
-AnchorReady event. See
-[ICLR2027_LMCACHE_SYSTEM_GATE_20260909.md](docs/ICLR2027_LMCACHE_SYSTEM_GATE_20260909.md).
-The next spend should implement D-side Anchor consumption and exact final
-verification, not enlarge the training run merely to fill an already adequate
-transport window.
+The real LMCache 1P1D integration now consumes the arrived Anchor online. The D
+node resolves zero-copy Target-KV views, runs the direct block model concurrently
+with Residual movement, repairs the suffix from the first authoritative Target
+token, and submits it to vLLM's full-KV verifier. In a strict 64-request
+token-ID observe--inject--observe sandwich, greedy output equals monolithic on
+64/64 requests and injection saves 24.407 ms total latency, 95% CI
+[19.513,29.671] ms, with no statistically separated TTFT change. Mean verified
+progress is 2.438 tokens, including 1.438 injected suffix tokens; hot draft and
+repair cost 24.860 and 3.035 ms. See
+[ICLR2027_ONLINE_LMCACHE_RESULT_20260909.md](docs/ICLR2027_ONLINE_LMCACHE_RESULT_20260909.md).
+
+The next GPU spend is model/data improvement, not another systems wiring pass.
+Train on exact 256-token `protected_uniform` runtime views and optimize suffix
+acceptance conditioned on authoritative `t1`. Use document-disjoint native 8K+
+prefixes, exclude every pilot/final evaluation document, and screen at least
+three seeds only after a cheap architecture run passes both held-out acceptance
+and live accepted-tokens/ms. In parallel, profile fusion of Anchor packing and
+the 3-ms repair; do not scale a checkpoint whose online latency gate is
+negative.
 
 Continue reporting `target_in_base_topk_rate` and
 `first_base_error_target_in_topk_rate` from `packet_eval.py`: low first-error
