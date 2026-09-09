@@ -1,5 +1,127 @@
 # Sparse-KV draft model training runbook
 
+> 2026-09-09 decision: stop scaling the EAGLE adapter. The active, lossless
+> direct-KV/block training protocol is
+> [ICLR2027_LOSSLESS_EXPLORATION.md](docs/ICLR2027_LOSSLESS_EXPLORATION.md).
+> The recommendations below are historical experiment records; Phase B/C
+> EAGLE expansion is no longer the next action.
+
+## Active direct-KV plan (supersedes the historical runbook below)
+
+Do not launch any EAGLE job in this file. The executable method and evidence are
+documented in [ICLR2027_ALGORITHM.md](docs/ICLR2027_ALGORITHM.md),
+[ICLR2027_LOSSLESS_EXPLORATION.md](docs/ICLR2027_LOSSLESS_EXPLORATION.md), and
+[ICLR2027_PILOT_REPORT_20260909.md](docs/ICLR2027_PILOT_REPORT_20260909.md).
+
+The inherited five-layer direct-KV block accepts 1.531 target tokens at the 10%
+priority view on 64 frozen long-prompt requests. A top-64 hidden-space causal
+reranker trained on 128 disjoint QMSum mechanism-development requests raises this
+to 2.188 at horizon 15 (paired delta +0.656, 95% CI [0.359,0.953]). At the
+latency-oriented horizon 7 it advances 3.141 target-verified output tokens per
+block including the correction/bonus. Zero KV accepts 0 and other-request KV
+accepts 0, so it still uses the correct KV content. This is not EAGLE: no Target
+hidden state enters the drafter.
+
+Do not scale the first full-vocabulary residual head unchanged. Although it
+improves acceptance, repeated vocabulary projections contend with transfer and
+make the 100-Gbps pipeline slower. The active implementation screen is the
+top-K hidden-space causal reranker in
+`experiments/lossless_pd/causal_correction_train.py`. It reuses one parallel base
+vocabulary projection and scores only gathered candidate LM-head rows. Promotion
+requires both held-out acceptance and positive integrated accepted-tokens/ms.
+That latency gate now passes in a clean, serial 100-Gbps one-host proxy: top-64,
+10% priority KV and `g=7` save 62.348 ms to equal output progress (95% CI
+[50.209,74.642]) with +0.032 ms mean first-commit delta. Do not run timing cells
+on multiple GPUs simultaneously; shared host-memory/PCIe contention invalidated
+the control as well as the treatment in the first attempt.
+
+The QMSum-only reranker does not generalize to MultiNews/GovReport, so it has
+been superseded by a 3000-step five-summary-set hidden-256 checkpoint. At `g=7`
+that checkpoint improves held-out-document acceptance from 1.531 to 2.313 on
+QMSum, 1.016 to 2.891 on MultiNews, and 1.000 to 4.547 on GovReport; paired deltas
+have 95% CIs [0.453,1.125], [1.672,2.078], and [3.219,3.875]. Its clean
+100-Gbps integrated QMSum run advances 3.312 verified output tokens and saves
+68.787 ms at equal progress (95% CI [56.626,81.581]) with -0.028 ms mean
+first-commit delta. These tasks occur in mechanism-training data, so the result
+is held-out-document evidence, not a final paper generalization claim.
+
+Continue reporting `target_in_base_topk_rate` and
+`first_base_error_target_in_topk_rate` from `packet_eval.py`: low first-error
+coverage calls for changing the candidate generator/top-K, while high coverage
+with low realized repair calls for more diverse block-wise training. The winning
+checkpoint is
+`outputs/progressive_kv/iclr2027_20260909/causal_rerank_summary5_s3000_h256_k64/checkpoint`
+on this development machine; generated checkpoints remain outside git.
+
+The next training corpus must have at least 8K native prefixes and must exclude
+QMSum pilot IDs 0..63 and all final LongBench/LongBench-v2 test documents. Split
+by source conversation/document before extracting windows. For each example,
+one immutable teacher pass produces:
+
+```text
+input:  known P seed token
+        exact Target K/V at layers 1,9,17,25,33 for nested 5/10/20% views
+        original absolute positions, prompt length, stage ID
+teacher: full-target distributions for 15 future positions
+audit:  prompt/reference/checkpoint hashes, page order, zero/shuffled controls
+output: full-vocabulary proposal logits; no target hidden state and no EAGLE state
+```
+
+Use the same frozen teacher packet and update sequence for every arm. Do not
+independently replay BF16 greedy targets: a fresh deterministic replay changed
+5/64 suffixes in the current audit. Teacher packets belong on a sharded/lazy
+reader; never materialize every full 36-layer cache in RAM or on disk.
+
+The first paper-relevant architecture screen should match supervised positions,
+data and optimizer across three arms:
+
+1. the present one-pass parallel block model with full-view training;
+2. the same model with correctly rounded nested long-prefix views;
+3. a direct-KV causal correction path (small GRU/2-layer AR head) conditioned on
+   earlier proposed tokens, still using only sparse Target KV and the known seed.
+
+The third arm addresses the present block model's exposure problem without
+returning to EAGLE. Evaluate proposal lengths 3/7/15 and visibility 5/10/20%,
+report accepted-prefix survival, zero-acceptance probability, accepted tokens per
+draft millisecond, and the integrated first-commit/equal-progress endpoints.
+Scale beyond the first 10K unique long prompts only if held-out 10% acceptance
+improves with a positive request-bootstrap CI and the 100-Gbps latency gate stays
+positive. Three training seeds are required for finalists, not for the initial
+architecture rejection screen.
+
+The current batched verifier is lossless in the standard speculative-decoding
+real-arithmetic sense but not bitwise identical to sequential BF16 execution on
+all requests. A minimal row-invariant oracle localized the required endpoint-shape
+operators to attention reduction, MLP down projection and RMSNorm for this Qwen3
+path. It is bitwise exact for logits and generated KV on 64/64 requests and takes
+219.14 ms versus 475.16 ms for whole-layer rowwise execution, but remains too
+slow. Training quality claims may use frozen references; a deployment-level
+bitwise claim requires these row programs to be fused as described in the
+algorithm document.
+
+Mechanism-only reranker screen (LongBench-derived QMSum rows 64..191 train and
+0..63 evaluation; do not use these rows for final paper quality claims):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m \
+  experiments.lossless_pd.causal_correction_train \
+  --train-packets \
+outputs/progressive_kv/iclr2027_20260909/train_packets_qmsum_offset64_n64,outputs/progressive_kv/iclr2027_20260909/train_packets_qmsum_offset128_n64 \
+  --eval-packets \
+outputs/progressive_kv/iclr2027_20260909/reference_packets_n64 \
+  --base-checkpoint \
+outputs/progressive_kv/iclr2027_20260909/pilot_n64_s1000/nested_block_gpu1/checkpoint \
+  --output outputs/progressive_kv/causal_rerank_k64 \
+  --steps 1000 --eval-requests 64 --fractions .05,.1,.2 \
+  --correction-mode rerank --correction-topk 64 \
+  --correction-hidden 128 --correction-bottleneck 128 \
+  --objective error_correct --preserve-weight 1 --lr 2e-4
+```
+
+---
+
+## Historical EAGLE runbook (do not execute)
+
 Status: cloud-training handoff, 2026-08-29.
 
 This document answers three practical questions:
