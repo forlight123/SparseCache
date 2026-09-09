@@ -32,7 +32,8 @@ main algorithm has no finite-W commitment and no lossy verifier.
 
 For a fixed visibility stage `s` and proposal length `g`:
 
-1. P sends the scheduled anchor pages, with their original positions, for the
+1. P computes and publishes the exact first Target token (the draft seed), then
+   sends the scheduled anchor pages, with their original positions, for the
    Target-KV layers consumed by the drafter.
 2. D samples or greedily constructs a candidate block from `q_s`. This work is
    internal and may overlap residual KV transfer.

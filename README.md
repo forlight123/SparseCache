@@ -1,10 +1,10 @@
 # SparseCache
 
 > Cloud training handoff: read [TRAIN.md](TRAIN.md) before spending GPU time.
-> The present 600-request drafter result proves that exact sparse KV carries a
-> usable signal, but it is not deployment-ready. The runbook separates the
-> immediately runnable EAGLE ceiling experiment from the compact-data and
-> sparse-native model work required for large-scale training.
+> The current model path is a direct Target-KV block drafter plus a causal
+> hidden-space top-64 reranker; EAGLE expansion has been stopped. The latest
+> real LMCache 1P1D gate exposes a roughly 109-ms AnchorReady--FullReady window
+> at 7.8K tokens while preserving all target KV bytes and exact final outputs.
 
 SparseCache is a reference framework for reusable RAG document KV. The current
 benchmark evaluates CacheBlend on its MuSiQue subset under a strict
@@ -41,6 +41,10 @@ The local development machine additionally has physical `CacheBlend/`,
 third-party histories, generated KV, large datasets, profiler traces, or model
 artifacts. Clone compatible third-party revisions and mount data separately
 when reproducing the systems experiments below.
+
+The current lossless P/D algorithm and the real LMCache gate are documented in
+[`docs/ICLR2027_ALGORITHM.md`](docs/ICLR2027_ALGORITHM.md) and
+[`docs/ICLR2027_LMCACHE_SYSTEM_GATE_20260909.md`](docs/ICLR2027_LMCACHE_SYSTEM_GATE_20260909.md).
 
 The copied CacheBlend tree has its own uv environment and no longer depends
 on the sibling repository's virtual environment:

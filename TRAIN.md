@@ -45,6 +45,18 @@ have 95% CIs [0.453,1.125], [1.672,2.078], and [3.219,3.875]. Its clean
 first-commit delta. These tasks occur in mechanism-training data, so the result
 is held-out-document evidence, not a final paper generalization claim.
 
+The real LMCache 1P1D gate now gathers and transfers a 12.903% whole-chunk
+Anchor before the residual. On 56 steady 7.8K prompts it exposes a 109.250-ms
+AnchorReady--FullReady interval (95% CI [109.139,109.366]); the observed
+`g=7` drafter maximum of 19.547 ms fits comfortably, although those timings are
+not yet from one concurrent process. A zero-proposal vLLM lifecycle hook also
+makes the exact online P seed available before store and binds it to the same
+AnchorReady event. See
+[ICLR2027_LMCACHE_SYSTEM_GATE_20260909.md](docs/ICLR2027_LMCACHE_SYSTEM_GATE_20260909.md).
+The next spend should implement D-side Anchor consumption and exact final
+verification, not enlarge the training run merely to fill an already adequate
+transport window.
+
 Continue reporting `target_in_base_topk_rate` and
 `first_base_error_target_in_topk_rate` from `packet_eval.py`: low first-error
 coverage calls for changing the candidate generator/top-K, while high coverage
