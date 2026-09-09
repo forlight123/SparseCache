@@ -3,8 +3,10 @@
 > Cloud training handoff: read [TRAIN.md](TRAIN.md) before spending GPU time.
 > The current model path is a direct Target-KV block drafter plus a causal
 > hidden-space top-64 reranker; EAGLE expansion has been stopped. The latest
-> real LMCache 1P1D gate exposes a roughly 109-ms AnchorReady--FullReady window
-> at 7.8K tokens while preserving all target KV bytes and exact final outputs.
+> real LMCache 1P1D gate exposes a roughly 108-ms AnchorReady--FullReady window
+> at 7.8K tokens. The decoder now resolves every Anchor CUDA object and exposes
+> zero-copy views of the five drafter layers while remaining 64/64 identical to
+> the authoritative full-KV P/D output.
 
 SparseCache is a reference framework for reusable RAG document KV. The current
 benchmark evaluates CacheBlend on its MuSiQue subset under a strict

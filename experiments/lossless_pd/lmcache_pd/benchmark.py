@@ -90,6 +90,15 @@ def stream_completion(
         if body == "[DONE]":
             continue
         event = json.loads(body)
+        if "error" in event:
+            raise RuntimeError(
+                f"endpoint stream failed ({endpoint}): {event['error']}"
+            )
+        if "choices" not in event:
+            raise RuntimeError(
+                f"endpoint stream returned an unexpected event ({endpoint}): "
+                f"{event}"
+            )
         text = event["choices"][0].get("text", "")
         if text and first is None:
             first = time.perf_counter()

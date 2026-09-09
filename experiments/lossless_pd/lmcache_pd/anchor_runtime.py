@@ -27,8 +27,14 @@ from typing import Any, Sequence
 
 
 _REQUEST_ID = contextvars.ContextVar("sparsecache_request_id", default="")
+_PD_REQUEST_ID = contextvars.ContextVar("sparsecache_pd_request_id", default="")
 _TRANSFER_PHASE = contextvars.ContextVar("sparsecache_transfer_phase", default="")
 _SEED_RECORD = contextvars.ContextVar("sparsecache_seed_record", default=None)
+_TRANSFER_KEYS = contextvars.ContextVar("sparsecache_transfer_keys", default=())
+_TRANSFER_KEY_BYTES = contextvars.ContextVar(
+    "sparsecache_transfer_key_bytes", default=()
+)
+_TRANSFER_INDICES = contextvars.ContextVar("sparsecache_transfer_indices", default=())
 _TRACE_LOCK = threading.Lock()
 _SEED_LOCK = threading.Lock()
 _PENDING_SEEDS: deque[dict] = deque()
@@ -117,6 +123,7 @@ def _phase_spec(
     total: int,
     request_id: str = "",
     seed_record: dict | None = None,
+    indices: Sequence[int] = (),
 ):
     """Clone a mutable LMCache DisaggSpec before asynchronous submission."""
 
@@ -136,6 +143,7 @@ def _phase_spec(
     result._sparsecache_phase = phase
     result._sparsecache_request_id = request_id
     result._sparsecache_seed_record = seed_record
+    result._sparsecache_indices = tuple(int(index) for index in indices)
     return result
 
 
@@ -258,6 +266,7 @@ def _install_gather_first_store(
                 total=len(memory_objs),
                 request_id=req_id,
                 seed_record=seed_record,
+                indices=indexes,
             )
             with store_stats.profile_put():
                 self.storage_manager.batched_put(
@@ -328,21 +337,42 @@ def install() -> None:
         transfer_spec = kwargs.get("transfer_spec")
         if transfer_spec is None and len(args) >= 5:
             transfer_spec = args[4]
+        keys = kwargs.get("keys")
+        if keys is None and args:
+            keys = args[0]
+        memory_objs = kwargs.get("memory_objs")
+        if memory_objs is None and len(args) >= 2:
+            memory_objs = args[1]
+        key_strings = tuple(
+            key.to_string() if hasattr(key, "to_string") else str(key)
+            for key in (keys or ())
+        )
+        key_bytes = tuple(int(obj.get_size()) for obj in (memory_objs or ()))
+        pd_request_id = getattr(transfer_spec, "req_id", "")
         request_id = getattr(
             transfer_spec,
             "_sparsecache_request_id",
-            getattr(transfer_spec, "req_id", ""),
+            pd_request_id,
         )
         phase = getattr(transfer_spec, "_sparsecache_phase", "")
         seed_record = getattr(transfer_spec, "_sparsecache_seed_record", None)
+        indices = getattr(transfer_spec, "_sparsecache_indices", ())
         request_token = _REQUEST_ID.set(request_id)
+        pd_request_token = _PD_REQUEST_ID.set(pd_request_id)
         phase_token = _TRANSFER_PHASE.set(phase)
         seed_token = _SEED_RECORD.set(seed_record)
+        keys_token = _TRANSFER_KEYS.set(key_strings)
+        key_bytes_token = _TRANSFER_KEY_BYTES.set(key_bytes)
+        indices_token = _TRANSFER_INDICES.set(indices)
         try:
             return await original_task(self, *args, **kwargs)
         finally:
+            _TRANSFER_INDICES.reset(indices_token)
+            _TRANSFER_KEY_BYTES.reset(key_bytes_token)
+            _TRANSFER_KEYS.reset(keys_token)
             _SEED_RECORD.reset(seed_token)
             _TRANSFER_PHASE.reset(phase_token)
+            _PD_REQUEST_ID.reset(pd_request_token)
             _REQUEST_ID.reset(request_token)
 
     async def anchor_first_write(self, objects, transfer_spec=None):
@@ -354,9 +384,19 @@ def install() -> None:
             row = {
                 "event": "nixl_write",
                 "request_id": _REQUEST_ID.get(),
+                "pd_request_id": _PD_REQUEST_ID.get(),
                 "phase": _TRANSFER_PHASE.get(),
                 "chunks": len(objects),
                 "bytes": total_bytes,
+                "keys": list(_TRANSFER_KEYS.get()),
+                "chunk_indices": list(_TRANSFER_INDICES.get()),
+                # ``bytes`` counts actual NIXL writes. ``resident_bytes`` also
+                # includes deduplicated keys that were already on the receiver
+                # and is therefore the correct mailbox-readiness invariant.
+                "resident_bytes": sum(_TRANSFER_KEY_BYTES.get()),
+                "remote_indexes": list(
+                    (transfer_spec or {}).get("remote_indexes", ())
+                ),
                 "started_ns": started_ns,
                 "finished_ns": finished_ns,
                 "write_ms": (finished_ns - started_ns) / 1e6,

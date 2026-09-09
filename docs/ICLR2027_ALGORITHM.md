@@ -274,3 +274,32 @@ runs, with zero committed-output mismatches. The performance gate for a bitwise
 claim is therefore explicit: reclaim at least 183 ms at the 100-Gbps endpoint,
 then rerun the same paired test. Standard speculative distributional losslessness
 does not depend on this stronger engineering contract.
+
+## 9. Real LMCache decoder data-plane gate
+
+The one-host 1P1D deployment now carries the progressive phase boundary into
+the decoder. P gathers four uniformly spaced token chunks first, waits for their
+actual NIXL completion, and sends the exact seed, cache keys, original chunk
+indices and completion timestamp to a D-side mailbox. D resolves those keys in
+LMCache's registered CUDA arena; the Residual continues through the unchanged
+full-KV path and remains the only phase allowed to emit FullReady.
+
+For the current drafter layers `[1,9,17,25,33]`, D pins the four owning Anchor
+objects and creates basic-slice tensor views. This is a representation contract,
+not a copy: 1,220/1,220 views across 64 QMSum requests alias their original CUDA
+storage. All 244 advertised objects and 9,210,691,584 resident bytes resolve.
+The complete receiver control path costs 0.911 ms on average while the 7.8K
+AnchorReady--FullReady window is 107.968 ms.
+
+Correctness is evaluated against a correctly hashed upstream full-KV P/D run.
+The progressive path matches it for 64/64 requests. Both variants differ from
+monolithic vLLM on the same 5/64 greedy requests, so those differences are a
+full-P/D execution-shape effect rather than progressive-KV drift. This also
+fixes the reproduction contract: `PYTHONHASHSEED=0`, P=`kv_producer`, and
+D=`kv_consumer` are mandatory. A missing hash seed can silently turn a supposed
+KV-reuse test into decoder recomputation.
+
+The next code boundary is now narrow: consume `ClaimedLayerViews` in the trained
+block drafter, seal its proposal epoch before FullReady, and verify only after
+the authoritative target cache is complete. The current result proves data
+availability and zero-copy layout, not concurrent draft speedup.

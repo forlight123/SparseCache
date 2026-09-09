@@ -55,6 +55,7 @@ def test_phase_specs_are_cloned_and_preserve_total_request_chunks():
         total=31,
         request_id="external-1",
         seed_record={"seed_token_id": 42},
+        indices=[3, 11, 19, 27],
     )
     residual = _phase_spec(
         original,
@@ -71,6 +72,7 @@ def test_phase_specs_are_cloned_and_preserve_total_request_chunks():
     assert residual._sparsecache_phase == "residual"
     assert anchor._sparsecache_request_id == "external-1"
     assert anchor._sparsecache_seed_record == {"seed_token_id": 42}
+    assert anchor._sparsecache_indices == (3, 11, 19, 27)
 
 
 def test_seed_queue_preserves_batch_order():

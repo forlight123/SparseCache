@@ -13,12 +13,10 @@ CPU:   request proxy on 19100
 ```
 
 This gate establishes functional P/D separation and measures the full-KV
-baseline. It does not by itself measure SparseCache, because upstream LMCache
-does not expose a progressively consumable subset to the direct-KV drafter.
-Promotion requires a connector extension that sends the five drafter-layer
-anchor pages first, preserves their original token positions, sends every
-remaining target byte exactly once, and exposes per-layer readiness to the
-verifier.
+baseline. The current hook also delivers a real AnchorReady notification to a
+decoder mailbox, resolves the advertised keys to the receiver's CUDA-backed
+``MemoryObj`` instances, and exposes ordered zero-copy views for the five
+drafter layers. It does not yet invoke the trained drafter or verifier online.
 
 The opt-in runtime hook provides two progressively stronger measurement modes:
 
@@ -48,6 +46,25 @@ that seed to the Anchor NIXL completion; when
 ``SPARSECACHE_ANCHOR_NOTIFY=udp://HOST:PORT`` is set, the same trace row is also
 emitted as a best-effort UDP AnchorReady control message.  Final outputs still
 come only from the original target path.
+
+On the decoder, set ``SPARSECACHE_RECEIVER_PATCH=1`` and
+``SPARSECACHE_ANCHOR_LISTEN=udp://HOST:PORT``. Optional
+``SPARSECACHE_DRAFT_LAYERS=1,9,17,25,33`` makes the mailbox pin the live Anchor
+objects, construct basic-slice tensor views, validate that every view aliases
+the registered CUDA storage, and release the owners. The public mailbox claim
+API retains the pins for a future asynchronous draft task.
+
+The launch contract is strict:
+
+* set ``PYTHONHASHSEED=0`` in both P and D before process creation;
+* launch P with vLLM ``kv_role=kv_producer``;
+* launch D with vLLM ``kv_role=kv_consumer``;
+* use the same model, LMCache chunk size, dtype, and hash policy on both nodes.
+
+Using ``kv_both`` on D is invalid for this unidirectional backend: a decoder
+boundary block may be stored with no receiver transfer specification. Omitting
+the fixed hash can make D miss transferred cache keys and silently recompute,
+which produces deceptively exact monolithic outputs but does not test KV reuse.
 
 The configured 24 GiB CUDA transfer buffer covers a length-stratified batch of
 distinct prompts without exhausting the receiver's registered PD arena. A 2
