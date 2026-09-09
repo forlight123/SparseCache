@@ -6,9 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from pathlib import Path
 import random
 import statistics
+from pathlib import Path
 
 
 def percentile(values, quantile):
@@ -37,8 +37,7 @@ def bootstrap_mean_ci(values, seed=20260825):
     values = list(values)
     rng = random.Random(seed)
     means = [
-        statistics.fmean(rng.choices(values, k=len(values)))
-        for _ in range(10_000)
+        statistics.fmean(rng.choices(values, k=len(values))) for _ in range(10_000)
     ]
     return [percentile(means, 0.025), percentile(means, 0.975)]
 
@@ -50,6 +49,16 @@ def paired_delta(left, right):
         "mean_95pct_bootstrap_ci": bootstrap_mean_ci(values),
         "positive_count": sum(value > 0 for value in values),
     }
+
+
+def accepted_draft_tokens(chain):
+    """Count proposals accepted by verifier stages in one pipeline trace."""
+
+    return sum(
+        int(stage.get("accepted_pending", 0))
+        for stage in chain["pipeline"]["trace"]
+        if stage.get("verified")
+    )
 
 
 def summarize(rows):
@@ -84,15 +93,14 @@ def summarize(rows):
             serial = [item["serial"] for item in chains]
             pipeline = [item["pipeline"] for item in chains]
             has_serial = all(item is not None for item in serial)
-            serial_ms = (
-                [item["response_ms"] for item in serial]
-                if has_serial
-                else None
-            )
+            serial_ms = [item["response_ms"] for item in serial] if has_serial else None
             pipeline_ms = [item["response_ms"] for item in pipeline]
             target_ms = [item["response_ms"] for item in targets]
             target_f1 = [item["f1"] for item in targets]
             chain_f1 = [item["f1"] for item in chains]
+            configured_drafts = [item["configured_draft_tokens"] for item in chains]
+            accepted_drafts = [accepted_draft_tokens(item) for item in chains]
+            injectable_suffixes = [max(0, accepted - 1) for accepted in accepted_drafts]
             schedule_result["chains"][window] = {
                 "quality": {
                     "em": statistics.fmean(item["em"] for item in chains),
@@ -112,14 +120,10 @@ def summarize(rows):
                         else None
                     ),
                 },
-                "serial_response_ms": (
-                    describe(serial_ms) if has_serial else None
-                ),
+                "serial_response_ms": (describe(serial_ms) if has_serial else None),
                 "pipeline_response_ms": describe(pipeline_ms),
                 "pipeline_latency_saved_vs_serial_ms": (
-                    paired_delta(serial_ms, pipeline_ms)
-                    if has_serial
-                    else None
+                    paired_delta(serial_ms, pipeline_ms) if has_serial else None
                 ),
                 "pipeline_latency_saved_vs_full_target_ms": paired_delta(
                     target_ms, pipeline_ms
@@ -132,6 +136,34 @@ def summarize(rows):
                 "pipeline_speedup_vs_full_target": describe(
                     a / b for a, b in zip(target_ms, pipeline_ms)
                 ),
+                "draft_acceptance": {
+                    "configured_tokens": describe(configured_drafts),
+                    "accepted_tokens": {
+                        **describe(accepted_drafts),
+                        "mean_95pct_bootstrap_ci": bootstrap_mean_ci(accepted_drafts),
+                    },
+                    "runtime_suffix_after_one_token_alignment": {
+                        **describe(injectable_suffixes),
+                        "mean_95pct_bootstrap_ci": bootstrap_mean_ci(
+                            injectable_suffixes
+                        ),
+                    },
+                    "accepted_fraction": describe(
+                        accepted / configured
+                        for accepted, configured in zip(
+                            accepted_drafts, configured_drafts
+                        )
+                    ),
+                    "zero_acceptance_rate": statistics.fmean(
+                        accepted == 0 for accepted in accepted_drafts
+                    ),
+                    "full_acceptance_rate": statistics.fmean(
+                        accepted == configured
+                        for accepted, configured in zip(
+                            accepted_drafts, configured_drafts
+                        )
+                    ),
+                },
                 "pipeline_transfer": {
                     "launched_stages": describe(
                         item["transfer"]["launched_stages"] for item in pipeline
@@ -143,12 +175,26 @@ def summarize(rows):
                         item["transfer"]["first_stage_h2d_ms"] for item in pipeline
                     ),
                     "transferred_kv_fraction": describe(
-                        item["transfer"]["total_bytes"]
-                        / row["logical_bf16_kv_bytes"]
+                        item["transfer"]["total_bytes"] / row["logical_bf16_kv_bytes"]
                         for item, row in zip(pipeline, rows)
                     ),
                 },
                 "pipeline_compute": {
+                    "first_draft_batch_ms": describe(
+                        item["first_draft_batch_ms"] for item in pipeline
+                    ),
+                    "draft_prefill_ms": describe(
+                        item["draft_prefill_ms"] for item in pipeline
+                    ),
+                    "draft_decode_ms": describe(
+                        item["draft_decode_ms"] for item in pipeline
+                    ),
+                    "final_correction_ms": describe(
+                        item["final_correction_ms"] for item in pipeline
+                    ),
+                    "final_decode_ms": describe(
+                        item["final_decode_ms"] for item in pipeline
+                    ),
                     "draft_and_refresh_ms": describe(
                         item["draft_and_refresh_ms"] for item in pipeline
                     ),

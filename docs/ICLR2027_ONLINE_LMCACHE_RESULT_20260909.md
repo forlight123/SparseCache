@@ -113,8 +113,8 @@ left pending.
 | quantity | result |
 |---|---:|
 | raw first sparse proposal equals Target `t1` | 54/64 (84.375%) |
-| target-conditioned accepted prefix | 2.438 tokens/request |
-| useful suffix beyond authoritative `t1` | 1.438 tokens/request |
+| legacy progress count, including authoritative `t1` | 2.438 tokens/request |
+| **accepted speculative suffix (standard metric)** | **1.438 tokens/request** |
 | accepted-prefix distribution | 1:24, 2:12, 3:10, 4:13, 5:4, 6:1 |
 | hot draft GPU time | 24.860 ms |
 | repair GPU time | 3.035 ms |
@@ -125,6 +125,10 @@ The offline exact-runtime-layout replay predicts 2.484 mean
 target-conditioned accepted tokens and 1.484 useful suffix tokens. The live
 values, 2.438 and 1.438, are close, supporting the metadata/packing equivalence
 between frozen packets and registered LMCache buffers.
+
+The 1.438 suffix value is below the paper gate.  This checkpoint is retained as
+evidence that the online LMCache mechanism works, but the learned-drafter branch
+is rejected as the primary SparseCache algorithm.
 
 ## Latency comparison
 

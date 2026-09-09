@@ -102,6 +102,10 @@ def run(args: argparse.Namespace) -> dict:
         draft_ms = (time.perf_counter() - started) * 1000
         proposal = proposal_tensor[0].tolist()
         target_conditioned_proposal = None
+        suffix_target_in_base_topk = None
+        suffix_target_in_diagnostic_topk = None
+        first_conditioned_error_target_in_topk = None
+        first_conditioned_error_target_in_diagnostic_topk = None
         repair_ms = None
         if prepared is not None and reference:
             repair_started = time.perf_counter()
@@ -117,7 +121,50 @@ def run(args: argparse.Namespace) -> dict:
             torch.cuda.synchronize()
             repair_ms = (time.perf_counter() - repair_started) * 1000
             target_conditioned_proposal = [reference[0], *repaired]
+            suffix_targets = torch.tensor(
+                reference[1:], device=prepared.candidate_ids.device
+            )
+            suffix_candidates = prepared.candidate_ids[0, 1 : len(reference)]
+            suffix_covered = suffix_candidates.eq(suffix_targets[:, None]).any(-1)
+            suffix_target_in_base_topk = (
+                float(suffix_covered.float().mean()) if suffix_covered.numel() else None
+            )
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                diagnostic_candidates = (
+                    target.lm_head(prepared.selected)
+                    .topk(
+                        min(args.diagnostic_topk, target.lm_head.weight.shape[0]),
+                        dim=-1,
+                    )
+                    .indices[0]
+                )
+            diagnostic_suffix = diagnostic_candidates[1 : len(reference)]
+            diagnostic_covered = diagnostic_suffix.eq(suffix_targets[:, None]).any(-1)
+            suffix_target_in_diagnostic_topk = (
+                float(diagnostic_covered.float().mean())
+                if diagnostic_covered.numel()
+                else None
+            )
         stop_ids = set(packet["stop_ids"].tolist())
+        target_conditioned_accepted = (
+            accepted_prefix(target_conditioned_proposal, reference, stop_ids)
+            if target_conditioned_proposal is not None
+            else None
+        )
+        if (
+            target_conditioned_accepted is not None
+            and 1 <= target_conditioned_accepted < len(reference)
+        ):
+            first_conditioned_error_target_in_topk = bool(
+                prepared.candidate_ids[0, target_conditioned_accepted]
+                .eq(reference[target_conditioned_accepted])
+                .any()
+            )
+            first_conditioned_error_target_in_diagnostic_topk = bool(
+                diagnostic_candidates[target_conditioned_accepted]
+                .eq(reference[target_conditioned_accepted])
+                .any()
+            )
         rows.append(
             {
                 "ordinal": ordinal,
@@ -129,10 +176,14 @@ def run(args: argparse.Namespace) -> dict:
                 "reference": reference,
                 "accepted": accepted_prefix(proposal, reference, stop_ids),
                 "target_conditioned_proposal": target_conditioned_proposal,
-                "target_conditioned_accepted": (
-                    accepted_prefix(target_conditioned_proposal, reference, stop_ids)
-                    if target_conditioned_proposal is not None
-                    else None
+                "target_conditioned_accepted": target_conditioned_accepted,
+                "suffix_target_in_base_topk": suffix_target_in_base_topk,
+                "suffix_target_in_diagnostic_topk": (suffix_target_in_diagnostic_topk),
+                "first_conditioned_error_target_in_topk": (
+                    first_conditioned_error_target_in_topk
+                ),
+                "first_conditioned_error_target_in_diagnostic_topk": (
+                    first_conditioned_error_target_in_diagnostic_topk
                 ),
                 "draft_ms": draft_ms,
                 "repair_ms": repair_ms,
@@ -174,6 +225,50 @@ def run(args: argparse.Namespace) -> dict:
                 if conditioned
                 else None
             ),
+            "mean_suffix_target_in_base_topk_rate": (
+                statistics.fmean(
+                    row["suffix_target_in_base_topk"]
+                    for row in rows
+                    if row["suffix_target_in_base_topk"] is not None
+                )
+                if conditioned
+                else None
+            ),
+            "diagnostic_topk": args.diagnostic_topk,
+            "mean_suffix_target_in_diagnostic_topk_rate": (
+                statistics.fmean(
+                    row["suffix_target_in_diagnostic_topk"]
+                    for row in rows
+                    if row["suffix_target_in_diagnostic_topk"] is not None
+                )
+                if conditioned
+                else None
+            ),
+            "first_conditioned_error_target_in_topk_rate": (
+                statistics.fmean(
+                    float(row["first_conditioned_error_target_in_topk"])
+                    for row in rows
+                    if row["first_conditioned_error_target_in_topk"] is not None
+                )
+                if any(
+                    row["first_conditioned_error_target_in_topk"] is not None
+                    for row in rows
+                )
+                else None
+            ),
+            "first_conditioned_error_target_in_diagnostic_topk_rate": (
+                statistics.fmean(
+                    float(row["first_conditioned_error_target_in_diagnostic_topk"])
+                    for row in rows
+                    if row["first_conditioned_error_target_in_diagnostic_topk"]
+                    is not None
+                )
+                if any(
+                    row["first_conditioned_error_target_in_diagnostic_topk"] is not None
+                    for row in rows
+                )
+                else None
+            ),
             "mean_draft_ms": statistics.fmean(row["draft_ms"] for row in rows),
             "mean_repair_ms": (
                 statistics.fmean(
@@ -201,8 +296,12 @@ def main() -> None:
     parser.add_argument("--fraction", type=float, default=0.1)
     parser.add_argument("--chunk-tokens", type=int, default=256)
     parser.add_argument("--mode", default="protected_uniform")
+    parser.add_argument("--diagnostic-topk", type=int, default=256)
     args = parser.parse_args()
-    if args.num_requests < 0 or min(args.draft_tokens, args.chunk_tokens) <= 0:
+    if (
+        args.num_requests < 0
+        or min(args.draft_tokens, args.chunk_tokens, args.diagnostic_topk) <= 0
+    ):
         parser.error("invalid request, draft, or chunk count")
     result = run(args)
     output = Path(args.output)

@@ -51,6 +51,30 @@ class PackedTargetKV:
     prompt_tokens: int
 
 
+def dynamic_cache_from_packed(config: Any, packed: PackedTargetKV):
+    """Install compact, already-RoPE'd Target KV without copying it again."""
+
+    from transformers import DynamicCache
+
+    expected_layers = int(config.num_hidden_layers)
+    if packed.keys.shape != packed.values.shape or packed.keys.ndim != 5:
+        raise ValueError("packed Target KV must have matching [B,L,H,T,D] shapes")
+    if packed.keys.shape[1] != expected_layers:
+        raise ValueError("target self-draft requires every Target KV layer")
+    cache = DynamicCache(config=config)
+    if len(cache.layers) != expected_layers:
+        raise ValueError("DynamicCache layer count does not match the Target")
+    for index, layer in enumerate(cache.layers):
+        key = packed.keys[:, index]
+        value = packed.values[:, index]
+        layer.keys = key
+        layer.values = value
+        layer.dtype = key.dtype
+        layer.device = key.device
+        layer.is_initialized = True
+    return cache
+
+
 def pack_claimed_target_kv(
     claim: ClaimedLayerViews,
     *,
@@ -527,16 +551,280 @@ class LiveSparseDrafter:
             self._thread.join(timeout=10)
 
 
+class LiveSparseTargetDrafter:
+    """Run exact-layer sparse self-drafting with a colocated HF Target copy."""
+
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        layers: tuple[int, ...],
+        draft_tokens: int,
+        trace_path: str,
+    ) -> None:
+        self.model_path = Path(model_path).resolve()
+        self.layers = layers
+        self.draft_tokens = draft_tokens
+        self.trace_path = trace_path
+        self.model = None
+        self.device = None
+        self.stream = None
+        self.eos_ids: set[int] = set()
+        self._jobs: queue.Queue[Any] = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._closed = False
+
+    def load_model(self, target_model: Any) -> None:
+        """Load one HF Target copy after vLLM has established the D device."""
+
+        import torch
+        from transformers import AutoModelForCausalLM
+
+        if self._thread is not None:
+            return
+        device = target_model.lm_head.weight.device
+        self.model = (
+            AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                dtype=torch.bfloat16,
+                attn_implementation="sdpa",
+            )
+            .to(device)
+            .eval()
+        )
+        expected_layers = int(self.model.config.num_hidden_layers)
+        if self.layers != tuple(range(expected_layers)):
+            raise ValueError("target self-draft needs SPARSECACHE_DRAFT_LAYERS=0..L-1")
+        generation = self.model.generation_config
+        eos = generation.eos_token_id
+        if eos is None:
+            eos_values = ()
+        elif isinstance(eos, (list, tuple, set)):
+            eos_values = eos
+        else:
+            eos_values = (eos,)
+        self.eos_ids = {int(value) for value in eos_values if value is not None}
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+        self._warmup()
+        self._thread = threading.Thread(
+            target=self._worker,
+            daemon=True,
+            name="sparsecache-live-target-drafter",
+        )
+        self._thread.start()
+
+    def _generate(self, packed: PackedTargetKV, seed_token_id: int):
+        import torch
+
+        assert self.model is not None and self.device is not None
+        visible = int(packed.keys.shape[-2])
+        cache = dynamic_cache_from_packed(self.model.config, packed)
+        current = torch.tensor([[seed_token_id]], device=self.device, dtype=torch.long)
+        attention_mask = torch.ones(
+            (1, visible + 1), device=self.device, dtype=torch.long
+        )
+        proposals = []
+        for step in range(self.draft_tokens):
+            output = self.model(
+                input_ids=current,
+                attention_mask=attention_mask,
+                position_ids=torch.tensor(
+                    [[packed.prompt_tokens + step]],
+                    device=self.device,
+                    dtype=torch.long,
+                ),
+                cache_position=torch.tensor(
+                    [visible + step], device=self.device, dtype=torch.long
+                ),
+                past_key_values=cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            token = int(output.logits[:, -1].argmax(dim=-1).item())
+            proposals.append(token)
+            cache = output.past_key_values
+            if token in self.eos_ids:
+                break
+            current = torch.tensor([[token]], device=self.device, dtype=torch.long)
+            attention_mask = torch.cat(
+                (
+                    attention_mask,
+                    torch.ones((1, 1), device=self.device, dtype=torch.long),
+                ),
+                dim=1,
+            )
+        return tuple(proposals)
+
+    def _warmup(self) -> None:
+        import torch
+
+        tokens = int(os.environ.get("SPARSECACHE_TARGET_DRAFTER_WARMUP_TOKENS", "1024"))
+        if tokens <= 0:
+            return
+        assert self.model is not None and self.device is not None
+        assert self.stream is not None
+        config = self.model.config
+        head_dim = int(
+            getattr(
+                config, "head_dim", config.hidden_size // config.num_attention_heads
+            )
+        )
+        started_ns = time.perf_counter_ns()
+        with torch.cuda.stream(self.stream), torch.inference_mode():
+            begin = torch.cuda.Event(enable_timing=True)
+            finished = torch.cuda.Event(enable_timing=True)
+            begin.record(self.stream)
+            keys = torch.zeros(
+                1,
+                config.num_hidden_layers,
+                config.num_key_value_heads,
+                tokens,
+                head_dim,
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
+            packed = PackedTargetKV(
+                keys=keys,
+                values=torch.zeros_like(keys),
+                positions=torch.arange(tokens, device=self.device),
+                prompt_tokens=max(tokens + 1, 8192),
+            )
+            self._generate(packed, 0)
+            finished.record(self.stream)
+        finished.synchronize()
+        if self.trace_path:
+            _append_trace(
+                self.trace_path,
+                {
+                    "event": "live_sparse_target_draft_warmup",
+                    "visible_tokens": tokens,
+                    "gpu_ms": begin.elapsed_time(finished),
+                    "wall_ms": (time.perf_counter_ns() - started_ns) / 1e6,
+                },
+            )
+
+    def submit(self, mailbox: AnchorMailbox, row: dict[str, Any]) -> None:
+        if not self._closed:
+            self._jobs.put((mailbox, row))
+
+    def _worker(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            self._run_one(*job)
+
+    def _run_one(self, mailbox: AnchorMailbox, row: dict[str, Any]) -> None:
+        import torch
+
+        claim = None
+        started_ns = time.perf_counter_ns()
+        try:
+            claim = mailbox.claim_layer_views(str(row["request_id"]), self.layers)
+            if claim is None:
+                raise RuntimeError("Anchor objects disappeared before target draft")
+            seed_token_id = int((row.get("seed_record") or {})["seed_token_id"])
+            assert self.model is not None and self.stream is not None
+            config = self.model.config
+            head_dim = int(
+                getattr(
+                    config,
+                    "head_dim",
+                    config.hidden_size // config.num_attention_heads,
+                )
+            )
+            with torch.cuda.stream(self.stream), torch.inference_mode():
+                begin = torch.cuda.Event(enable_timing=True)
+                packed_event = torch.cuda.Event(enable_timing=True)
+                finished = torch.cuda.Event(enable_timing=True)
+                begin.record(self.stream)
+                packed = pack_claimed_target_kv(
+                    claim,
+                    num_key_value_heads=int(config.num_key_value_heads),
+                    head_dim=head_dim,
+                )
+                packed_event.record(self.stream)
+                proposals = self._generate(packed, seed_token_id)
+                finished.record(self.stream)
+            finished.synchronize()
+            finished_ns = time.perf_counter_ns()
+            draft = ReadyDraft(
+                request_id=str(row.get("request_id", "")),
+                pd_request_id=str(row.get("pd_request_id", "")),
+                prompt_tokens=packed.prompt_tokens,
+                seed_token_id=seed_token_id,
+                proposals=proposals,
+                anchor_received_ns=int(row["receiver_received_ns"]),
+                draft_started_ns=started_ns,
+                draft_finished_ns=finished_ns,
+                pack_gpu_ms=begin.elapsed_time(packed_event),
+                model_gpu_ms=packed_event.elapsed_time(finished),
+                total_gpu_ms=begin.elapsed_time(finished),
+                wall_ms=(finished_ns - started_ns) / 1e6,
+                visible_tokens=int(packed.positions.numel()),
+                actual_fraction=packed.positions.numel() / packed.prompt_tokens,
+            )
+            _REGISTRY.publish(draft)
+            if self.trace_path:
+                _append_trace(
+                    self.trace_path,
+                    {
+                        "event": "live_sparse_draft",
+                        **{
+                            item.name: getattr(draft, item.name)
+                            for item in fields(ReadyDraft)
+                            if item.name != "continuation"
+                        },
+                        "proposals": list(draft.proposals),
+                        "drafter_kind": "target",
+                        "model": str(self.model_path),
+                        "layers": list(self.layers),
+                    },
+                )
+        except Exception as error:  # noqa: BLE001
+            if self.trace_path:
+                _append_trace(
+                    self.trace_path,
+                    {
+                        "event": "live_sparse_draft_error",
+                        "request_id": str(row.get("request_id", "")),
+                        "pd_request_id": str(row.get("pd_request_id", "")),
+                        "draft_started_ns": started_ns,
+                        "draft_finished_ns": time.perf_counter_ns(),
+                        "drafter_kind": "target",
+                        "error": repr(error),
+                    },
+                )
+        finally:
+            if claim is not None:
+                claim.release()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._thread is not None:
+            self._jobs.put(None)
+            self._thread.join(timeout=10)
+
+
 _SERVICE_LOCK = threading.Lock()
-_SERVICE: LiveSparseDrafter | None = None
+_SERVICE: LiveSparseDrafter | LiveSparseTargetDrafter | None = None
 
 
-def get_online_drafter() -> LiveSparseDrafter | None:
+def get_online_drafter() -> LiveSparseDrafter | LiveSparseTargetDrafter | None:
     """Return the process-local service, creating it from explicit env only."""
 
     global _SERVICE
+    kind = os.environ.get("SPARSECACHE_DRAFTER_KIND", "block")
+    if kind not in {"block", "target"}:
+        raise ValueError("SPARSECACHE_DRAFTER_KIND must be block or target")
     checkpoint = os.environ.get("SPARSECACHE_DRAFTER_CHECKPOINT", "")
-    if not checkpoint:
+    target_path = os.environ.get("SPARSECACHE_TARGET_DRAFTER_MODEL", "")
+    if kind == "block" and not checkpoint:
+        return None
+    if kind == "target" and not target_path:
         return None
     with _SERVICE_LOCK:
         if _SERVICE is None:
@@ -547,12 +835,15 @@ def get_online_drafter() -> LiveSparseDrafter | None:
                 ).split(",")
                 if value.strip()
             )
-            _SERVICE = LiveSparseDrafter(
-                checkpoint,
-                layers=layers,
-                draft_tokens=int(os.environ.get("SPARSECACHE_DRAFT_TOKENS", "7")),
-                trace_path=os.environ.get("SPARSECACHE_DRAFT_TRACE", ""),
-            )
+            common = {
+                "layers": layers,
+                "draft_tokens": int(os.environ.get("SPARSECACHE_DRAFT_TOKENS", "7")),
+                "trace_path": os.environ.get("SPARSECACHE_DRAFT_TRACE", ""),
+            }
+            if kind == "block":
+                _SERVICE = LiveSparseDrafter(checkpoint, **common)
+            else:
+                _SERVICE = LiveSparseTargetDrafter(target_path, **common)
         return _SERVICE
 
 
@@ -568,7 +859,10 @@ class OnlineSparseKVProposer:
         self.trace_path = os.environ.get("SPARSECACHE_DRAFT_TRACE", "")
         self.service = get_online_drafter()
         if self.service is None:
-            raise ValueError("SPARSECACHE_DRAFTER_CHECKPOINT is required")
+            raise ValueError(
+                "configure SPARSECACHE_DRAFTER_CHECKPOINT for block mode or "
+                "SPARSECACHE_TARGET_DRAFTER_MODEL for target mode"
+            )
         self._pending_feedback: list[PendingVerify] = []
 
     def load_model(self, target_model: Any) -> None:
@@ -602,6 +896,7 @@ class OnlineSparseKVProposer:
                         len(draft.proposals),
                         max(1, num_tokens - (draft.prompt_tokens + 2)),
                     )
+                    accepted_injected_suffix = max(0, accepted - 1)
                     if self.trace_path:
                         _append_trace(
                             self.trace_path,
@@ -609,7 +904,14 @@ class OnlineSparseKVProposer:
                                 "event": "online_verify_feedback",
                                 "request_id": draft.request_id,
                                 "pd_request_id": draft.pd_request_id,
+                                # Kept for compatibility with the first online
+                                # report.  It includes the authoritative t1
+                                # alignment position and is not the standard
+                                # serving acceptance metric.
                                 "accepted_prefix": accepted,
+                                "accepted_injected_suffix": (
+                                    accepted_injected_suffix
+                                ),
                                 "proposal_tokens": len(draft.proposals),
                                 "num_tokens_no_spec": num_tokens,
                             },

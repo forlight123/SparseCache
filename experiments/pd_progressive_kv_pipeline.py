@@ -498,6 +498,15 @@ def parse_args() -> argparse.Namespace:
         default="original",
     )
     parser.add_argument(
+        "--ruler-prompt-mode",
+        choices=("legacy_llama", "model_chat"),
+        default="legacy_llama",
+        help=(
+            "legacy_llama preserves historical runs; model_chat renders the "
+            "structured RULER request with the evaluated model's own template"
+        ),
+    )
+    parser.add_argument(
         "--longbench-prompt-mode",
         choices=("generic", "official", "official_chat"),
         default="official_chat",
@@ -743,6 +752,7 @@ def tokenize_longbench_prompt(
                 [{"role": "user", "content": official}],
                 tokenize=False,
                 add_generation_prompt=True,
+                enable_thinking=False,
             )
         else:
             rendered = official
@@ -794,18 +804,34 @@ def tokenize_longbench_v2_prompt(
     )
 
 
-def tokenize_ruler_prompt(tokenizer, row, *, placement):
+def tokenize_ruler_prompt(tokenizer, row, *, placement, prompt_mode="legacy_llama"):
     placeholder = "{DOCUMENTS}"
-    rendered = (
-        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>"
-        "You are a helpful assistant<|eot_id|><|start_header_id|>user"
-        "<|end_header_id|>Answer the question based on the given documents. "
-        "Only give me the answer and do not output any other words.\n\nThe "
-        f"following are given documents.\n\n{placeholder}\n\nAnswer the question "
-        "based on the given documents. Only give me the answer and do not "
-        f"output any other words.\n\nQuestion: {row['question']}<|eot_id|>"
-        "<|start_header_id|>assistant<|end_header_id|> Answer:"
+    user = (
+        "Answer the question based on the given documents. Only give me the "
+        "answer and do not output any other words.\n\nThe following are given "
+        f"documents.\n\n{placeholder}\n\nAnswer the question based on the given "
+        "documents. Only give me the answer and do not output any other words."
+        f"\n\nQuestion: {row['question']}\nAnswer:"
     )
+    if prompt_mode == "legacy_llama":
+        rendered = (
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>"
+            "You are a helpful assistant<|eot_id|><|start_header_id|>user"
+            f"<|end_header_id|>{user}<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>"
+        )
+    elif prompt_mode == "model_chat":
+        rendered = tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": user},
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    else:
+        raise ValueError(f"unknown RULER prompt mode: {prompt_mode}")
     pivot = rendered.index(placeholder)
     prefix = tuple(tokenizer.encode(rendered[:pivot], add_special_tokens=False))
     suffix = tuple(
@@ -1270,7 +1296,10 @@ def evaluate_example(model, tokenizer, row, dataset_index, args, device):
         dataset_name = "longbench_v2"
     elif args.dataset_format == "ruler":
         prefix, documents, suffix = tokenize_ruler_prompt(
-            tokenizer, row, placement=args.ruler_placement
+            tokenizer,
+            row,
+            placement=args.ruler_placement,
+            prompt_mode=args.ruler_prompt_mode,
         )
         question = row["question"]
         golds = list(row["answers"])
@@ -1679,6 +1708,9 @@ def evaluate_example(model, tokenizer, row, dataset_index, args, device):
         "ruler_placement": (
             args.ruler_placement if args.dataset_format == "ruler" else None
         ),
+        "ruler_prompt_mode": (
+            args.ruler_prompt_mode if args.dataset_format == "ruler" else None
+        ),
         "question": question,
         "gold_answers": golds,
         "all_classes": row.get("all_classes"),
@@ -1799,6 +1831,9 @@ def main() -> None:
         "context_truncation": args.context_truncation,
         "ruler_placement": (
             args.ruler_placement if args.dataset_format == "ruler" else None
+        ),
+        "ruler_prompt_mode": (
+            args.ruler_prompt_mode if args.dataset_format == "ruler" else None
         ),
         "sample_count": args.sample_count,
         "sample_seed": args.seed,

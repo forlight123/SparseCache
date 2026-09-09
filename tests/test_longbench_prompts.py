@@ -25,9 +25,12 @@ class CharacterTokenizer:
     def decode(self, token_ids, skip_special_tokens=True):
         return "".join(chr(item) for item in token_ids)
 
-    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+    def apply_chat_template(
+        self, messages, *, tokenize, add_generation_prompt, enable_thinking=False
+    ):
         assert tokenize is False
         assert add_generation_prompt is True
+        assert enable_thinking is False
         return "<user>" + messages[-1]["content"] + "<assistant>"
 
 
@@ -135,6 +138,28 @@ def test_ruler_placement_preserves_document_evidence_labels():
     assert [document.supporting for document in documents] == [False, True]
     assert "Distractor" in documents[0].text
     assert "Evidence" in documents[1].text
+
+
+def test_ruler_model_chat_uses_native_template_without_llama_control_tokens():
+    row = {
+        "question": "Who?",
+        "documents": [{"text": "Evidence\nanswer", "supporting": True}],
+        "placements": {"original": [0]},
+    }
+
+    prefix, documents, suffix = tokenize_ruler_prompt(
+        CharacterTokenizer(),
+        row,
+        placement="original",
+        prompt_mode="model_chat",
+    )
+    rendered = CharacterTokenizer().decode(
+        list(prefix) + list(documents[0].token_ids) + list(suffix)
+    )
+
+    assert rendered.startswith("<user>")
+    assert rendered.endswith("<assistant>")
+    assert "<|start_header_id|>" not in rendered
 
 
 def test_prompt_budget_trims_only_distractors_and_recomputes_positions():

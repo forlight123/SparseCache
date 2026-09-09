@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,7 +8,9 @@ import torch
 from experiments.lossless_pd.lmcache_pd.online_drafter import (
     _REGISTRY,
     OnlineSparseKVProposer,
+    PackedTargetKV,
     ReadyDraft,
+    dynamic_cache_from_packed,
     pack_claimed_target_kv,
 )
 from experiments.lossless_pd.lmcache_pd.receiver_runtime import ClaimedLayerViews
@@ -63,6 +66,33 @@ def test_pack_claimed_target_kv_requires_exact_ranges():
     )
     with pytest.raises(ValueError, match="exact token range"):
         pack_claimed_target_kv(claim, num_key_value_heads=2, head_dim=2)
+
+
+def test_dynamic_cache_from_packed_installs_all_layers_without_copy():
+    from transformers import Qwen3Config
+
+    config = Qwen3Config(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        vocab_size=32,
+    )
+    keys = torch.randn(1, 2, 2, 3, 4)
+    packed = PackedTargetKV(
+        keys=keys,
+        values=torch.randn_like(keys),
+        positions=torch.tensor([0, 3, 7]),
+        prompt_tokens=8,
+    )
+
+    cache = dynamic_cache_from_packed(config, packed)
+
+    assert cache.get_seq_length() == 3
+    assert cache.layers[0].keys.data_ptr() == packed.keys[:, 0].data_ptr()
+    assert cache.layers[1].values.data_ptr() == packed.values[:, 1].data_ptr()
 
 
 def ready_draft(*, first=17):
@@ -140,9 +170,10 @@ def test_target_conditioned_repair_salvages_a_first_token_mismatch():
     assert value.propose([[31]], np.array([4]), np.array([[2, 3, 5, 11]])) == [[32, 33]]
 
 
-def test_next_step_feedback_recovers_verified_prefix_length():
+def test_next_step_feedback_reports_only_useful_injected_suffix(tmp_path):
     _REGISTRY.clear()
     value = proposer(speculative_tokens=3)
+    value.trace_path = str(tmp_path / "trace.jsonl")
     _REGISTRY.publish(ready_draft())
     assert value.propose(
         [[17]],
@@ -160,3 +191,7 @@ def test_next_step_feedback_recovers_verified_prefix_length():
         np.array([[2, 3, 5, 11, 17, 19, 31]]),
     ) == [[]]
     assert value._pending_feedback == []
+    rows = [json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()]
+    feedback = next(row for row in rows if row["event"] == "online_verify_feedback")
+    assert feedback["accepted_prefix"] == 2
+    assert feedback["accepted_injected_suffix"] == 1

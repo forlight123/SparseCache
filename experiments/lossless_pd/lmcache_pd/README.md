@@ -80,6 +80,34 @@ This prototype's losslessness contract is greedy decoding only. Sampling needs
 the repaired proposal probabilities and a sampling-aware acceptance rule before
 it may be claimed lossless.
 
+### Direct Target self-draft gate
+
+The learned five-layer block drafter above is retained as a baseline, but its
+task-unseen accepted length is too low for the main SparseCache route.  The
+runtime also supports an untrained, exact-weight Target self-drafter that reads
+all Target layers from the compact Anchor KV and is verified by the ordinary
+full-KV vLLM Target:
+
+```text
+SPARSECACHE_DRAFTER_KIND=target
+SPARSECACHE_TARGET_DRAFTER_MODEL=/data/models/qwen/Qwen3-8B
+SPARSECACHE_DRAFT_LAYERS=0,1,2,...,35
+SPARSECACHE_DRAFT_TOKENS=9  # one t1 alignment + at most eight injected tokens
+SPARSECACHE_TARGET_DRAFTER_WARMUP_TOKENS=1024
+SPARSECACHE_ONLINE_DRAFT_MODE=observe|inject
+```
+
+Do not set `SPARSECACHE_DRAFTER_CHECKPOINT` for this mode.  The current
+prototype loads a second Hugging Face copy of the Target on D after vLLM has
+initialized, so the D launch must reserve roughly another model-weight-sized
+GPU allocation.  It is an integration/correctness gate, not the final memory
+architecture; production code should share vLLM weights and use a paged sparse
+attention kernel.  A first-proposal mismatch fails closed (no suffix is
+injected), and every injected suffix is still checked by vLLM against complete
+KV before commitment.  For the example above, launch the D custom proposer with
+`num_speculative_tokens=8`; paper metrics must report only accepted injected
+suffix tokens and must not count the `t1` alignment position.
+
 For exact frozen-packet replay, launch the CPU proxy through:
 
 ```bash
@@ -118,10 +146,12 @@ observe-only measurements:
 
 All three raw streamed P/D outputs equal one another and the paired monolithic
 output on 64/64 requests. TTFT is unchanged because proposals accelerate tokens
-after the first authoritative token. Total latency falls because full-KV
-verification accepts a mean 2.438-token prefix, including a mean 1.438 injected
-suffix tokens per request. The raw first-token sparse proposal matches 54/64
-requests, but target-conditioned repair injects a block on every request.
+after the first authoritative token. The legacy progress counter is 2.438, but
+it includes one already-authoritative Target token; the standard accepted
+speculative suffix is only 1.438 tokens/request. This learned branch is an
+online-mechanism proof, not the primary paper method. The raw first-token sparse
+proposal matches 54/64 requests, but target-conditioned repair injects a block
+on every request.
 
 Hot sparse-KV draft time is 24.86 ms, repair time is 3.035 ms on GPU, and the
 completed draft leads its D-side handoff by 236.25 ms on average. This proves
