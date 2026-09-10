@@ -1,5 +1,12 @@
 # SparseCache acceptance-gate iteration (2026-09-09)
 
+> **Protocol correction (2026-09-10).** The pilot horizon table reused a
+> `g=6` artifact sampled from a 200-row pool while `g=4/8/12` used a 150-row
+> pool; 5/30 request IDs differ. The table remains a historical acceptance
+> screen, but its latency optimum is not confirmatory. The corrected
+> identical-request held-out sweep selects the leaner `g=6` descriptively;
+> `g=6` and `g=8` differ by +2.07 ms, 95% CI [-7.52, 11.64].
+
 ## Outcome
 
 The short-draft objection is resolved, but the paper gate is not.  With a

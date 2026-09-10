@@ -191,3 +191,43 @@ stay under ignored `outputs/`.
 
 The 24-GiB receiver CUDA arena is required for the 64-request run because
 transferred chunks remain resident long enough to exhaust a 2-GiB arena.
+
+## Exact P-runahead baseline (experimental)
+
+`runahead_token_proxy.py` is a bounded source-side continuation control. It
+asks the exact P Target for more than the usual one token, requires vLLM to
+return their integer IDs, appends those IDs to the D request, and reduces D's
+remaining output budget. It never retokenizes generated text. Launch it with
+the same arguments as `direct_token_proxy.py`:
+
+```bash
+SPARSECACHE_P_RUNAHEAD_TOKENS=4 \
+PYTHONPATH="$PWD:/home/ytm/algorithm/kvreuse/LMCache" \
+  /home/ytm/algorithm/kvreuse/LMCache/.venv-vllm/bin/python -m \
+  experiments.lossless_pd.lmcache_pd.runahead_token_proxy \
+  --host 127.0.0.1 --port 19100 \
+  --prefiller-host 127.0.0.1 --prefiller-port <P_PORT> \
+  --decoder-host 127.0.0.1 --decoder-port <D_PORT> \
+  --decoder-init-port <D_INIT_PORT> --decoder-alloc-port <D_ALLOC_PORT>
+```
+
+Benchmark it with two discarded warm-up requests and exact output IDs:
+
+```bash
+PYTHONPATH="$PWD:/home/ytm/algorithm/kvreuse/LMCache" \
+  /home/ytm/algorithm/kvreuse/LMCache/.venv-vllm/bin/python -m \
+  experiments.lossless_pd.lmcache_pd.benchmark_runahead \
+  --packets <PACKET_ROOT> --output <RESULT.json> \
+  --num-requests 32 --warmup-requests 2 \
+  --max-input-tokens 7680 --max-new-tokens 8 --runahead-tokens 4
+```
+
+The measured one-host result is a negative control. At 256-token-aligned prompt
+boundaries, `k=4` returns identical integer output IDs on 32/32 requests but is
+7.05 ms slower in total, CI [5.33, 8.65], and 52.53 ms slower to first token,
+CI [51.25, 53.74], than the normal one-token handoff. D recomputes the short
+P-generated suffix and that cost is charged. With a 7,800-token unaligned
+boundary, D retrieves only 7,680 tokens and output IDs match 7/8, demonstrating
+that exact Target weights do not imply bitwise equality across a recomputed BF16
+state boundary. Use aligned boundaries for the bitwise baseline and retain the
+unaligned result as an exactness diagnostic.

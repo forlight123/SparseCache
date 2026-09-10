@@ -1,6 +1,6 @@
 # SparseCache-PD related-work and baseline map
 
-Status: working evidence map, 2026-08-27. “Code” means a public repository was
+Status: working evidence map, updated 2026-09-10. “Code” means a public repository was
 found, not that its results have been reproduced locally.
 
 ## 1. Positioning by bottleneck and correctness endpoint
@@ -10,6 +10,9 @@ found, not that its results have been reproduced locally.
 | Lynx | P/D transition transfer | yes | dense top-4-bit KV draft | reconstructed hierarchical INT8 `Q_full` | exact to compressed target; BF16 task-score equivalent | not found | nearest communication/speculation baseline; author-paper only |
 | SmartGen | P/D transition plus later on-demand fetch | yes | sparse InfiniGen/HATA target attention | sparse selected KV; full cache arrives gradually | approximate task-quality endpoint | not found; author page link is empty | selective-transfer Pareto baseline |
 | OasisKV | decode-node HBM capacity and tier traffic | yes in its P/D mode | EAGLE lookahead plus sparse prefetched attention | sparse working set over remote full cache | approximate, reported small quality loss | not found | memory-tier/throughput Pareto baseline |
+| SparseSpec-L | local long-context draft cost | no | training-free same-model sparse attention | full target verifier | speculative exactness candidate | not found | nearest sparse self-draft baseline |
+| Kairos | P/D queueing and transfer | no; it avoids transfer | chunked prefill deflected to D | ordinary decode on D | exact target | linked repository returned 404 | load-aware placement baseline |
+| Pallas | active-request state migration | target reconstructs while source decodes | source exact decode plus target prefix reconstruction | migrated exact state | exact target | not found | source-runahead/migration concept baseline |
 | SparseCache-PD | P/D transition transfer | yes, internally only | exact sparse-page same-model draft | original full BF16/FP16 KV | exact target after one verifier | local implementation | proposed method |
 | MagicDec | local long-context draft cost | no | sparse-KV draft model | full target verifier | speculative exactness candidate | yes | local sparse-draft compute baseline |
 | TriForce | local/offloaded long-context draft cost | no | retrieved sparse self-draft plus small model | full target verifier | speculative exactness candidate | yes | hierarchical sparse-draft baseline |
@@ -35,6 +38,18 @@ tokens behind one original-full-KV verifier.
 - **OasisKV**: [paper](https://arxiv.org/abs/2608.08097). It is a vLLM-based
   system, but no author repository was found. It retains full KV in a lower
   tier and predicts/prefetches a sparse HBM working set with draft lookahead.
+- **SparseSpec-L**: [paper](https://arxiv.org/abs/2607.27735). It already
+  combines training-free same-model sparse attention with an adaptive
+  speculation horizon, but does not address a P/D state handoff. No public
+  author repository was found in the September 10 search.
+- **Kairos**: [paper](https://arxiv.org/abs/2607.02043). It performs load-aware
+  prefill deflection onto D and removes KV transfer for those requests; generic
+  load-aware P/D placement is therefore not new. The paper points to a GitHub
+  repository, but that URL returned 404 during the September 10 audit.
+- **Pallas**: [paper](https://arxiv.org/abs/2608.16477). It overlaps ongoing
+  source decoding and suffix-KV streaming with target-side prefix
+  reconstruction for mobile handover. Exact source runahead during state
+  movement is therefore prior art outside the P/D-serving setting.
 - **MagicDec**: [paper](https://arxiv.org/abs/2408.11049),
   [code](https://github.com/Infini-AI-Lab/MagicDec).
 - **TriForce**: [paper](https://arxiv.org/abs/2404.11912),

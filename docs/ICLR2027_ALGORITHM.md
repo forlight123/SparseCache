@@ -354,3 +354,64 @@ unchanged (-0.635 ms, 95% CI [-1.579,+0.353]) and reduces total latency by
 24.407 ms (95% CI [19.513,29.671] ms saved), with 63/64 requests faster and
 64/64 outputs equal to monolithic. The fixed system result and its limitations
 are in `ICLR2027_ONLINE_LMCACHE_RESULT_20260909.md`.
+
+## 11. Slack-priced horizon after the confidence-policy failure
+
+The September 10 scale experiment rejects minimum sparse-logit margin as a
+generalizing per-request horizon signal. The replacement policy uses only
+observable systems state plus an acceptance-survival curve frozen on training
+data. It does not inspect tentative token identities, so it cannot bias the
+proposal distribution under sampling.
+
+Measure from AnchorReady. Let `R` be Residual time, `C_g` sparse-D time for a
+sealed `g`-token proposal, `V_g` full-Target block-verification time, `tau` the
+ordinary D Target token interval, and `U_g` the number of sequential Target
+steps eliminated by the verified block. Then
+
+```text
+T_0       = R + n tau
+T_g       = max(R, C_g) + V_g + (n - U_g) tau
+Gain(g)   = U_g tau - V_g - [C_g - R]_+ .
+```
+
+This identity exposes the only three terms that determine a draft's value:
+verified Target progress, verifier cost, and draft overrun beyond
+residual-transfer slack. It also explains why exact P runahead failed live:
+moving exact decode steps from D to P does not remove suffix-state work and
+does not create additional slack in the current LMCache state machine.
+
+For accepted-prefix random variable `A`,
+
+```text
+E[min(A,g)] = sum_{i=1..g} Pr[A >= i].
+```
+
+If marginal verification/overrun cost is nondecreasing, the optimal fixed
+horizon is the first `g` whose next survival-weighted token value no longer
+pays its marginal cost:
+
+```text
+tau Pr[A >= g+1]
+  <= Delta V_g + Delta [C_g - R]_+ + lambda_D(q) Delta C_g.
+```
+
+`lambda_D(q)` prices interference imposed on ordinary decode work at current D
+queue state `q`. Under decreasing prefix survival and nondecreasing marginal
+cost, the left side decreases and the right side increases, giving a single
+threshold and an `O(log |G|)` search over profiled horizons. Without those
+shape conditions the finite candidate set is enumerated. A lower-confidence
+admission version launches only when
+
+```text
+LCB(E[Gain(g) | context_bucket, link_bucket])
+  > lambda_D(q) C_g + safety_margin.
+```
+
+This controller is endpoint-invariant: `g` changes only hidden proposal work;
+the same immutable full-KV Target acceptance rule governs every committed
+token. Its empirical obligations are now precise: estimate the prefix-survival
+curve on natural long-form outputs, measure `C_g,V_g,R,tau` in the integrated
+runtime, freeze the buckets and safety margin, and test on disjoint arrival
+traces. The 90-request RULER QA2 sweep cannot fit this policy because 81/90
+`g=8` drafts encounter EOS; its accepted fixed-horizon fillers are not survival
+observations.

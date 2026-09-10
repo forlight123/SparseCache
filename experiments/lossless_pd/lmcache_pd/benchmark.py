@@ -82,6 +82,7 @@ def stream_completion(
     first = None
     chunks = 0
     pieces = []
+    token_ids = []
     for line in response.iter_lines(decode_unicode=True):
         if not line or not line.startswith("data: "):
             continue
@@ -95,7 +96,9 @@ def stream_completion(
             raise RuntimeError(
                 f"endpoint stream returned an unexpected event ({endpoint}): {event}"
             )
-        text = event["choices"][0].get("text", "")
+        choice = event["choices"][0]
+        text = choice.get("text", "")
+        token_ids.extend(int(value) for value in choice.get("token_ids") or [])
         if text and first is None:
             first = time.perf_counter()
         pieces.append(text)
@@ -109,6 +112,7 @@ def stream_completion(
         "total_ms": (finished - started) * 1000,
         "chunks": chunks,
         "text": "".join(pieces),
+        "token_ids": token_ids,
     }
 
 

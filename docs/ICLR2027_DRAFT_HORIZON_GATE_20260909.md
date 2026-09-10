@@ -2,6 +2,16 @@
 
 Date: 2026-09-09
 
+> **Protocol correction (2026-09-10).** The historical horizon table below is
+> not a fully request-paired sweep: `g=4/8/12` used `sample_count=150`, whereas
+> the reused `g=6` artifact used `sample_count=200`, changing 5 of the 30
+> sampled requests. It must not be used to select `g=8`. A clean, identical-ID
+> held-out rerun gives mean saved latency of 57.58, 83.34, 81.27, and 34.54 ms
+> for `g=4/6/8/12`, respectively. The paired `g=6 - g=8` difference is only
+> +2.07 ms with bootstrap 95% CI [-7.52, 11.64], so the two are statistically
+> tied and `g=6` is the leaner fixed operating point. See
+> `ICLR2027_JOINT_POLICY_GATE_20260910.md` for the corrected evidence.
+
 ## Decision
 
 The learned five-layer KVShot-style drafter is rejected as the primary method.
@@ -55,10 +65,12 @@ to only `1.438` useful speculative suffix tokens.
   no token is exposed before verification.
 - Measurement: paired baseline/pipeline order alternates by request; both paths
   are warmed; request bootstrap uses 10,000 resamples.
-- Compute: three otherwise-idle H200 NVL GPUs run `g=4`, `g=8`, and `g=12` on
-  identical sample order.  The existing `g=6` run uses the same protocol.
+- Compute: three otherwise-idle H200 NVL GPUs ran `g=4`, `g=8`, and `g=12` on
+  identical sample order. The historical `g=6` row used the same runtime
+  protocol but a different sampling-pool size and therefore is not fully
+  request-paired with those rows.
 
-## Results
+## Historical screening results (superseded for horizon selection)
 
 | `g` | accepted `E[A]` (95% CI) | online suffix | acceptance | `P(A=0)` | first draft block | latency saved (95% CI) | speedup |
 |---:|---:|---:|---:|---:|---:|---:|---:|
