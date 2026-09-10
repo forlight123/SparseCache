@@ -67,6 +67,21 @@ The first live gate uses a third GPU so drafter compute cannot perturb D.  A
 paper result must additionally report resource-normalized throughput and a
 co-located D-side configuration; an uncharged extra GPU is not a valid win.
 
+That gate has now completed on a fresh-server 64-request
+observe--inject--observe sandwich.  Greedy live output IDs match on 64/64,
+accepted injected suffix is 3.953 tokens/request, and injection saves 30.690 ms
+(95% CI 21.814--39.479 ms), but total speedup is only 1.0379x and TTFT regresses
+by 3.192 ms.  It therefore fails the pre-registered 1.10x stop-loss threshold;
+the dedicated-4B portfolio is retained as a positive mechanism baseline, not
+the ICLR main line.  See `docs/ICLR2027_DRAFTER_STOPLOSS_PIVOT_20260910.md`.
+
+`benchmark_pd_packets.py` replays packet token IDs without occupying the third
+GPU with a monolithic control.  `analyze_external_draft_gate.py` joins its three
+arms with the proxy/draft traces and evaluates the frozen gate.  Same-stack
+observe output is the executable losslessness reference because vLLM and the
+Transformers packet builder diverge on a small, identical set of low-margin
+requests.
+
 ## Runtime sequence
 
 1. P samples the exact seed through `SeedSignalProposer`. The proposer itself

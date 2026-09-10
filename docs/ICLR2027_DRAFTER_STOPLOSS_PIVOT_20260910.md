@@ -112,7 +112,7 @@ costs.  The current non-streaming live bridge implements the same semantics but
 waits for the whole first branch; streaming root synchronization is the next
 latency optimization.
 
-## Next live gate
+## Live gate result
 
 The implemented bridge performs:
 
@@ -123,9 +123,41 @@ client prompt -> P Target prefill/seed ---------> exact KV layer stream -> D
 D: proposal + arriving exact layers -> one immutable full Target verifier
 ```
 
-The first paired gate is observe--inject--observe on at least 64 requests.  It
-must have 100% output-ID equality, mean accepted suffix at least 3.5, zero mean
-draft overrun, at least 1.10x total speedup, and a positive paired saving CI.
-It must charge the third GPU and then repeat with 4B co-located on D.  Failure
-of either latency or resource-normalized controls stops the portfolio as the
-ICLR main line rather than motivating another unconstrained drafter revision.
+The pre-registered observe--inject--observe gate was run on 64 requests with
+fresh P, D, proxy, and 4B sidecar processes for every arm.  Packet token IDs
+were submitted directly.  The third H200 was used only by the 4B sidecar, so
+its resource cost is explicit rather than hidden by a monolithic control.
+
+| metric | result | gate |
+|---|---:|---:|
+| Three-arm live token-ID equality | 64/64 | 64/64 |
+| Accepted injected suffix | 3.953/7 | at least 3.5 |
+| Positive-acceptance requests | 49/64 | diagnostic |
+| Concurrent seed-branch hits | 63/64 | diagnostic |
+| Draft available before FullReady | 64/64 | 64/64 |
+| Sandwich observe total | 839.684 ms | -- |
+| Inject total | 808.994 ms | -- |
+| Total saving | 30.690 ms, CI [21.814, 39.479] | CI above zero |
+| Total speedup | **1.0379x** | **at least 1.10x** |
+| TTFT change | +3.192 ms, CI [+1.552, +5.289] | diagnostic |
+
+The live vLLM outputs differ from the Transformers-built immutable packet on
+the same nine request ordinals in all three arms.  This is a backend-numerics
+audit result, not a speculative mismatch: all three live token sequences are
+identical on 64/64.  A losslessness claim therefore uses same-stack ordinary
+Target output as its executable reference and retains the HF packets only as
+immutable input and cross-backend diagnostics.
+
+The portfolio fails exactly one pre-registered criterion: 1.10x speedup.  It
+is stopped as the ICLR main line before co-location or broader task scaling.
+The positive 30.7-ms saving remains a mechanism result, but a dedicated third
+GPU for 3.8% latency improvement is not a publishable system tradeoff.
+
+This is also evidence that another round of drafter training is the wrong next
+move.  Requests with all seven injected suffix tokens accepted save only 52.3
+ms on average in this run; requests with zero accepted tokens add 11.7 ms.  At
+the current eight-output endpoint, even the empirical perfect-acceptance cell
+is only about 1.066x, below the fixed gate.  The next structural candidate must
+remove verifier/control cost or amortize one verification over a materially
+larger useful block.  It must first demonstrate a measured upper bound above
+1.10x; otherwise it is rejected without training.

@@ -10,6 +10,18 @@ from pathlib import Path
 from experiments.lossless_pd.lmcache_pd.benchmark import bootstrap_mean_ci
 
 
+def _same_output(left: dict, right: dict) -> bool:
+    left_tokens = left["pd"].get("token_ids")
+    right_tokens = right["pd"].get("token_ids")
+    if left_tokens is not None and right_tokens is not None:
+        return left_tokens == right_tokens
+    return left["pd"]["text"] == right["pd"]["text"]
+
+
+def _has_monolithic(*groups: list[dict]) -> bool:
+    return all("monolithic" in row for group in groups for row in group)
+
+
 def paired_summary(observe_rows: list[dict], inject_rows: list[dict]) -> dict:
     if [row["record_id"] for row in observe_rows] != [
         row["record_id"] for row in inject_rows
@@ -19,7 +31,7 @@ def paired_summary(observe_rows: list[dict], inject_rows: list[dict]) -> dict:
         raise ValueError("benchmark request counts differ")
 
     output_matches = [
-        left["pd"]["text"] == right["pd"]["text"]
+        _same_output(left, right)
         for left, right in zip(observe_rows, inject_rows, strict=True)
     ]
     result = {
@@ -37,11 +49,6 @@ def paired_summary(observe_rows: list[dict], inject_rows: list[dict]) -> dict:
         # The monolithic endpoint is replayed in both sequential runs.  This
         # difference-in-differences removes host/run drift shared with that
         # endpoint, while retaining the same request as the cluster unit.
-        adjusted = [
-            (right["pd"][metric] - right["monolithic"][metric])
-            - (left["pd"][metric] - left["monolithic"][metric])
-            for left, right in zip(observe_rows, inject_rows, strict=True)
-        ]
         result[f"inject_minus_observe_{metric}"] = {
             "mean_ms": statistics.fmean(raw),
             "bootstrap_95ci_ms": bootstrap_mean_ci(raw),
@@ -49,21 +56,30 @@ def paired_summary(observe_rows: list[dict], inject_rows: list[dict]) -> dict:
             "same": sum(value == 0 for value in raw),
             "inject_slower": sum(value > 0 for value in raw),
         }
-        result[f"difference_in_differences_{metric}"] = {
-            "mean_ms": statistics.fmean(adjusted),
-            "bootstrap_95ci_ms": bootstrap_mean_ci(adjusted),
-        }
-    observe_mono = [
-        index for index, row in enumerate(observe_rows) if not row["outputs_equal"]
-    ]
-    inject_mono = [
-        index for index, row in enumerate(inject_rows) if not row["outputs_equal"]
-    ]
-    result.update(
-        observe_monolithic_mismatch_ordinals=observe_mono,
-        inject_monolithic_mismatch_ordinals=inject_mono,
-        same_monolithic_mismatch_set=observe_mono == inject_mono,
-    )
+        if _has_monolithic(observe_rows, inject_rows):
+            adjusted = [
+                (right["pd"][metric] - right["monolithic"][metric])
+                - (left["pd"][metric] - left["monolithic"][metric])
+                for left, right in zip(observe_rows, inject_rows, strict=True)
+            ]
+            result[f"difference_in_differences_{metric}"] = {
+                "mean_ms": statistics.fmean(adjusted),
+                "bootstrap_95ci_ms": bootstrap_mean_ci(adjusted),
+            }
+    observe_mono = [index for index, row in enumerate(observe_rows) if not row["outputs_equal"]]
+    inject_mono = [index for index, row in enumerate(inject_rows) if not row["outputs_equal"]]
+    if _has_monolithic(observe_rows, inject_rows):
+        result.update(
+            observe_monolithic_mismatch_ordinals=observe_mono,
+            inject_monolithic_mismatch_ordinals=inject_mono,
+            same_monolithic_mismatch_set=observe_mono == inject_mono,
+        )
+    else:
+        result.update(
+            observe_reference_mismatch_ordinals=observe_mono,
+            inject_reference_mismatch_ordinals=inject_mono,
+            same_reference_mismatch_set=observe_mono == inject_mono,
+        )
     return result
 
 
@@ -78,7 +94,7 @@ def sandwich_summary(
     ] != record_ids:
         raise ValueError("sandwich benchmark record order differs")
     exact = [
-        before["pd"]["text"] == inject["pd"]["text"] == after["pd"]["text"]
+        _same_output(before, inject) and _same_output(inject, after)
         for before, inject, after in zip(
             observe_before, inject_rows, observe_after, strict=True
         )
@@ -95,11 +111,16 @@ def sandwich_summary(
         "pd_mismatch_ordinals": [
             index for index, matches in enumerate(exact) if not matches
         ],
-        "all_three_equal_monolithic": sum(monolithic_exact),
-        "monolithic_mismatch_ordinals": [
+        "all_three_equal_reference": sum(monolithic_exact),
+        "reference_mismatch_ordinals": [
             index for index, matches in enumerate(monolithic_exact) if not matches
         ],
     }
+    if _has_monolithic(observe_before, inject_rows, observe_after):
+        result["all_three_equal_monolithic"] = sum(monolithic_exact)
+        result["monolithic_mismatch_ordinals"] = result[
+            "reference_mismatch_ordinals"
+        ]
     for metric in ("ttft_ms", "total_ms"):
         delta = []
         adjusted = []
@@ -109,10 +130,11 @@ def sandwich_summary(
         ):
             baseline = (before["pd"][metric] + after["pd"][metric]) / 2
             delta.append(inject["pd"][metric] - baseline)
-            before_gap = before["pd"][metric] - before["monolithic"][metric]
-            inject_gap = inject["pd"][metric] - inject["monolithic"][metric]
-            after_gap = after["pd"][metric] - after["monolithic"][metric]
-            adjusted.append(inject_gap - (before_gap + after_gap) / 2)
+            if _has_monolithic(observe_before, inject_rows, observe_after):
+                before_gap = before["pd"][metric] - before["monolithic"][metric]
+                inject_gap = inject["pd"][metric] - inject["monolithic"][metric]
+                after_gap = after["pd"][metric] - after["monolithic"][metric]
+                adjusted.append(inject_gap - (before_gap + after_gap) / 2)
             drift.append(after["pd"][metric] - before["pd"][metric])
         result[f"inject_minus_sandwich_observe_{metric}"] = {
             "mean_ms": statistics.fmean(delta),
@@ -121,10 +143,11 @@ def sandwich_summary(
             "same": sum(value == 0 for value in delta),
             "inject_slower": sum(value > 0 for value in delta),
         }
-        result[f"sandwich_difference_in_differences_{metric}"] = {
-            "mean_ms": statistics.fmean(adjusted),
-            "bootstrap_95ci_ms": bootstrap_mean_ci(adjusted),
-        }
+        if adjusted:
+            result[f"sandwich_difference_in_differences_{metric}"] = {
+                "mean_ms": statistics.fmean(adjusted),
+                "bootstrap_95ci_ms": bootstrap_mean_ci(adjusted),
+            }
         result[f"observe_after_minus_before_{metric}"] = {
             "mean_ms": statistics.fmean(drift),
             "bootstrap_95ci_ms": bootstrap_mean_ci(drift),

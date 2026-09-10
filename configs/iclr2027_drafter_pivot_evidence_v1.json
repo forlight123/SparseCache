@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "date": "2026-09-10",
-  "decision": "stop_sparse_target_kv_adapter_pivot_to_budgeted_model_portfolio",
+  "decision": "stop_external_model_portfolio_as_iclr_mainline",
   "immutable_target": "/data/models/qwen/Qwen3-8B",
   "proposal_horizon": 8,
   "sparse_target_fraction": 0.1,
@@ -35,7 +35,7 @@
         "MultiFieldQA": 5.015625,
         "Qasper": 3.828125
       },
-      "status": "passes_offline_proposer_gate_needs_live_confirmation"
+      "status": "passes_live_acceptance_but_fails_live_speedup_gate"
     }
   },
   "live_stoploss": {
@@ -46,5 +46,28 @@
     "minimum_total_speedup": 1.1,
     "require_positive_paired_saving_ci": true,
     "require_charged_resource_normalized_control": true
+  },
+  "live_result": {
+    "protocol": "fresh_server_observe_inject_observe",
+    "requests": 64,
+    "all_three_output_ids_equal": 64,
+    "mean_accepted_injected_suffix": 3.953125,
+    "positive_acceptance_requests": 49,
+    "seed_branch_hits": 63,
+    "drafts_before_fullready": 64,
+    "observe_sandwich_total_ms": 839.6839315628313,
+    "inject_total_ms": 808.9941015205113,
+    "total_speedup": 1.0379357896239765,
+    "inject_minus_observe_total_ms": -30.689830042319954,
+    "inject_minus_observe_total_ci95_ms": [
+      -39.47894793600426,
+      -21.81356099754339
+    ],
+    "inject_minus_observe_ttft_ms": 3.1922875332384137,
+    "inject_minus_observe_ttft_ci95_ms": [
+      1.5520558936259476,
+      5.289097502100049
+    ],
+    "failed_gate": "minimum_total_speedup_1.10x"
   }
 }

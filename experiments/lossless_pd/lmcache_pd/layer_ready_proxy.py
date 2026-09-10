@@ -15,6 +15,7 @@ import os
 import socket
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -232,6 +233,60 @@ def _remove_upstream_completion_route(upstream: Any) -> None:
     ]
 
 
+def _install_cancellable_zmq_proxy(upstream: Any) -> None:
+    """Give the LMCache example proxy a bounded shutdown poll interval.
+
+    The upstream coroutine awaits ``socket.recv()`` indefinitely and only
+    checks its shutdown flag after a message arrives.  Fresh-server sandwich
+    arms would therefore leave the control port and process alive.  This local
+    equivalent preserves its message handling while polling every 200 ms.
+    """
+
+    async def polling_zmq_pull_server() -> None:
+        channel = upstream.zmq_ctx.socket(upstream.zmq.PULL)
+        proxy_url = f"{upstream.global_args.proxy_host}:{upstream.global_args.proxy_port}"
+        try:
+            channel.bind(f"tcp://{proxy_url}")
+        except upstream.zmq.ZMQError:
+            upstream.logger.exception(
+                "ZMQ proxy server failed to bind on %s", proxy_url
+            )
+            return
+        upstream.logger.info("ZMQ proxy server started on %s", proxy_url)
+        try:
+            while upstream.run_proxy:
+                try:
+                    message_bytes = await asyncio.wait_for(
+                        channel.recv(), timeout=0.2
+                    )
+                except TimeoutError:
+                    continue
+                except upstream.zmq.ZMQError as error:
+                    if error.errno in (upstream.zmq.ETERM, upstream.zmq.ENOTSOCK):
+                        break
+                    upstream.logger.warning("ZMQ recv error: %s", error)
+                    await asyncio.sleep(0.05)
+                    continue
+                try:
+                    message = upstream.msgspec.msgpack.decode(
+                        message_bytes, type=upstream.PDMsg
+                    )
+                except upstream.msgspec.DecodeError as error:
+                    upstream.logger.warning("ZMQ received non-PD message: %s", error)
+                    continue
+                except Exception:
+                    upstream.logger.exception("ZMQ message decode failed")
+                    continue
+                if not isinstance(message, upstream.ProxyNotif):
+                    continue
+                upstream.app.state.finished_reqs[message.req_id] += 1
+        finally:
+            channel.close()
+            upstream.logger.info("ZMQ PULL server stopped.")
+
+    upstream.zmq_pull_server = polling_zmq_pull_server
+
+
 def main() -> None:
     try:
         from examples.disagg_prefill import disagg_proxy_server as upstream
@@ -273,12 +328,44 @@ def main() -> None:
             trust_env=False,
         )
 
+    # LMCache's current example proxy stores AsyncClient inside ClientInfo but
+    # calls ``ClientInfo.aclose()`` during shutdown.  Supply that forwarding
+    # method locally so repeated fresh-server sandwich arms terminate cleanly.
+    if not hasattr(upstream.ClientInfo, "aclose"):
+
+        async def close_client_info(value) -> None:
+            await value.client.aclose()
+
+        upstream.ClientInfo.aclose = close_client_info
+
+    # The sidecar client is first used on uvicorn's loop and must be closed on
+    # that same loop.  Wrapping the existing LMCache lifespan avoids attempting
+    # to close an httpcore transport from a new asyncio.run() loop afterwards.
+    original_lifespan = upstream.app.router.lifespan_context
+
+    @asynccontextmanager
+    async def sparsecache_lifespan(app):
+        try:
+            async with original_lifespan(app):
+                yield
+        finally:
+            if external_client is not None:
+                await external_client.aclose()
+
+    upstream.app.router.lifespan_context = sparsecache_lifespan
+
     async def send_external(request_data: dict[str, Any]) -> dict[str, Any]:
         if external_client is None:
             raise RuntimeError("external draft client is disabled")
         response = await external_client.post("/v1/completions", json=request_data)
         response.raise_for_status()
         return response.json()
+
+    async def send_external_timed(
+        request_data: dict[str, Any]
+    ) -> tuple[dict[str, Any], int]:
+        response = await send_external(request_data)
+        return response, time.perf_counter_ns()
 
     async def preserve_token_ids(client, endpoint: str, request: dict):
         prompt = request.get("prompt")
@@ -287,6 +374,7 @@ def main() -> None:
         return await original_send(client, endpoint, request)
 
     upstream.send_request_to_service = preserve_token_ids
+    _install_cancellable_zmq_proxy(upstream)
     _remove_upstream_completion_route(upstream)
     upstream.counter = time.time_ns()
 
@@ -316,7 +404,7 @@ def main() -> None:
                 # equals P's exact seed the suffix is already complete; a root
                 # mismatch falls back to one prefix-cached conditional call.
                 external_prefill_task = asyncio.create_task(
-                    send_external(
+                    send_external_timed(
                         external_draft_request(
                             external_template,
                             prompt_ids,
@@ -369,8 +457,9 @@ def main() -> None:
                 if external_prefill_task is None:
                     return False
                 try:
-                    prefill_response = await external_prefill_task
-                    suffix_started_ns = time.perf_counter_ns()
+                    prefill_response, concurrent_finished_ns = (
+                        await external_prefill_task
+                    )
                     prefill_tokens = external_token_ids(prefill_response)
                     proposals = matched_external_suffix(
                         prefill_tokens,
@@ -378,8 +467,13 @@ def main() -> None:
                         max_tokens=external_tokens,
                     )
                     seed_branch_hit = proposals is not None
+                    concurrent_ms = (
+                        concurrent_finished_ns - external_started_ns
+                    ) / 1e6
+                    fallback_ms = 0.0
                     if proposals is None:
-                        response = await send_external(
+                        fallback_started_ns = time.perf_counter_ns()
+                        response, finished_ns = await send_external_timed(
                             external_draft_request(
                                 external_template,
                                 [*prompt_ids, first_token],
@@ -388,7 +482,9 @@ def main() -> None:
                             )
                         )
                         proposals = external_token_ids(response)[:external_tokens]
-                    finished_ns = time.perf_counter_ns()
+                        fallback_ms = (finished_ns - fallback_started_ns) / 1e6
+                    else:
+                        finished_ns = concurrent_finished_ns
                     payload = external_draft_payload(
                         pd_request_id=pd_request_id,
                         prompt_tokens=len(prompt_ids),
@@ -396,7 +492,7 @@ def main() -> None:
                         proposals=proposals,
                         started_ns=external_started_ns,
                         finished_ns=finished_ns,
-                        model_ms=(finished_ns - suffix_started_ns) / 1e6,
+                        model_ms=concurrent_ms + fallback_ms,
                     )
                     from experiments.lossless_pd.lmcache_pd.anchor_runtime import (
                         _send_anchor_notification,
@@ -406,12 +502,15 @@ def main() -> None:
                     append_trace(
                         trace_path,
                         {
-                            "event": "external_draft_submitted",
                             **payload,
+                            "event": "external_draft_submitted",
                             "prefill_overlap_ms": (
-                                suffix_started_ns - external_started_ns
+                                min(prefill_returned_ns, concurrent_finished_ns)
+                                - external_started_ns
                             )
                             / 1e6,
+                            "concurrent_branch_ms": concurrent_ms,
+                            "fallback_branch_ms": fallback_ms,
                             "seed_branch_hit": seed_branch_hit,
                         },
                     )
@@ -529,8 +628,6 @@ def main() -> None:
         )
     finally:
         mailbox.close()
-        if external_client is not None:
-            asyncio.run(external_client.aclose())
 
 
 if __name__ == "__main__":
