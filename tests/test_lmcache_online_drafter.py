@@ -12,6 +12,7 @@ from experiments.lossless_pd.lmcache_pd.online_drafter import (
     ReadyDraft,
     dynamic_cache_from_packed,
     pack_claimed_target_kv,
+    ready_draft_from_external_payload,
 )
 from experiments.lossless_pd.lmcache_pd.receiver_runtime import ClaimedLayerViews
 
@@ -218,3 +219,47 @@ def test_next_step_feedback_reports_only_useful_injected_suffix(tmp_path):
     feedback = next(row for row in rows if row["event"] == "online_verify_feedback")
     assert feedback["accepted_prefix"] == 2
     assert feedback["accepted_injected_suffix"] == 1
+
+
+def test_external_payload_becomes_root_conditioned_ready_draft():
+    draft = ready_draft_from_external_payload(
+        {
+            "request_id": "req",
+            "pd_request_id": "pd",
+            "prompt_tokens": 8,
+            "seed_token_id": 11,
+            "proposals": [17, 19, 23],
+            "draft_started_ns": 100,
+            "draft_finished_ns": 250,
+            "model_ms": 7.5,
+        },
+        received_ns=300,
+    )
+
+    assert draft.proposals == (17, 19, 23)
+    assert draft.root_branches == {17: (17, 19, 23)}
+    assert draft.wall_ms == 0.00015
+    assert draft.draft_started_ns == 300
+    assert draft.draft_finished_ns == 300
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("prompt_tokens", 0),
+        ("seed_token_id", True),
+        ("proposals", []),
+        ("proposals", [1, False]),
+    ],
+)
+def test_external_payload_rejects_invalid_contract(field, value):
+    row = {
+        "request_id": "req",
+        "pd_request_id": "pd",
+        "prompt_tokens": 8,
+        "seed_token_id": 11,
+        "proposals": [17],
+    }
+    row[field] = value
+    with pytest.raises((TypeError, ValueError)):
+        ready_draft_from_external_payload(row, received_ns=300)

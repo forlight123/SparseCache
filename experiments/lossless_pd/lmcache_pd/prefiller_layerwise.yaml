@@ -1,0 +1,17 @@
+local_cpu: false
+use_layerwise: true
+
+enable_pd: true
+transfer_channel: nixl
+pd_role: sender
+pd_proxy_host: 127.0.0.1
+pd_proxy_port: 17500
+pd_buffer_size: 25769803776
+pd_buffer_device: cuda
+nixl_backends: [UCX]
+
+pd_backend_mode: async
+pd_max_prefill_len: 8192
+pd_allocation_timeout_sec: 30
+pd_shutdown_timeout_sec: 10
+pd_condition_poll_interval_sec: 0.01

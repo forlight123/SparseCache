@@ -85,7 +85,7 @@ def pack_claimed_target_kv(
 
     import torch
 
-    chunks = len(claim.objects)
+    chunks = len(claim.chunk_indices)
     if chunks == 0 or not claim.layers:
         raise ValueError("an online draft requires nonempty chunks and layers")
     if len(claim.token_ranges) != chunks:
@@ -226,6 +226,43 @@ class DraftRegistry:
 
 
 _REGISTRY = DraftRegistry()
+
+
+def _notify_draft_ready(draft: ReadyDraft) -> None:
+    """Wake the CPU proxy only after draft and initial Target layers are ready."""
+
+    endpoint = os.environ.get("SPARSECACHE_DRAFT_NOTIFY", "")
+    if not endpoint:
+        return
+    from experiments.lossless_pd.lmcache_pd.anchor_runtime import (
+        _send_anchor_notification,
+    )
+
+    _send_anchor_notification(
+        endpoint,
+        {
+            "event": "draft_ready",
+            "request_id": draft.request_id,
+            "pd_request_id": draft.pd_request_id,
+            "prompt_tokens": draft.prompt_tokens,
+            "seed_token_id": draft.seed_token_id,
+            "proposals": len(draft.proposals),
+            "draft_finished_ns": draft.draft_finished_ns,
+        },
+    )
+
+
+def _publish_for_early_dispatch(mailbox: Any, draft: ReadyDraft) -> None:
+    """Publish proposals locally, then gate early D dispatch on layer readiness."""
+
+    _REGISTRY.publish(draft)
+    ready_through = int(os.environ.get("SPARSECACHE_DISPATCH_READY_LAYER", "1"))
+    timeout = float(os.environ.get("SPARSECACHE_LAYER_WAIT_TIMEOUT_SEC", "30"))
+    if ready_through >= 0:
+        ready = mailbox.wait_layer(draft.request_id, ready_through, timeout=timeout)
+        if ready is None:
+            return
+    _notify_draft_ready(draft)
 
 
 class _VllmLMHeadAdapter:
@@ -476,7 +513,7 @@ class LiveSparseDrafter:
                 actual_fraction=packed.positions.numel() / packed.prompt_tokens,
                 continuation=continuation,
             )
-            _REGISTRY.publish(draft)
+            _publish_for_early_dispatch(mailbox, draft)
             if self.trace_path:
                 _append_trace(
                     self.trace_path,
@@ -580,6 +617,9 @@ class LiveSparseTargetDrafter:
         self._jobs: queue.Queue[Any] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._closed = False
+        self.cascade = None
+        self.cascade_checkpoint: Path | None = None
+        self.cascade_layers: tuple[int, ...] = ()
 
     def load_model(self, target_model: Any) -> None:
         """Load one HF Target copy after vLLM has established the D device."""
@@ -613,6 +653,38 @@ class LiveSparseTargetDrafter:
         self.eos_ids = {int(value) for value in eos_values if value is not None}
         self.device = device
         self.stream = torch.cuda.Stream(device=device)
+        cascade_checkpoint = os.environ.get("SPARSECACHE_CASCADE_CHECKPOINT", "")
+        if cascade_checkpoint:
+            from experiments.blockdraft.model import BlockKVDraft
+            from experiments.lossless_pd.core import ProgressiveBlock
+
+            self.cascade_checkpoint = Path(cascade_checkpoint).resolve()
+            base = BlockKVDraft.load_checkpoint(self.cascade_checkpoint)
+            self.cascade = ProgressiveBlock(base)
+            stage = self.cascade_checkpoint / "stage.pt"
+            if stage.exists():
+                self.cascade.stage.load_state_dict(
+                    torch.load(stage, map_location="cpu", weights_only=True)
+                )
+            self.cascade = self.cascade.to(device=device, dtype=torch.bfloat16).eval()
+            self.cascade_layers = tuple(
+                int(value)
+                for value in os.environ.get(
+                    "SPARSECACHE_CASCADE_DRAFT_LAYERS", "1,9,17,25,33"
+                ).split(",")
+                if value.strip()
+            )
+            if (
+                len(self.cascade_layers)
+                != self.cascade.base.config.num_target_kv_layers
+                or min(self.cascade_layers) < 0
+                or max(self.cascade_layers) >= expected_layers
+            ):
+                raise ValueError(
+                    "cascade Target-KV layer list does not match its checkpoint"
+                )
+            if self.root_topk != 1:
+                raise ValueError("cascade drafting currently requires root top-k one")
         self._warmup()
         self._thread = threading.Thread(
             target=self._worker,
@@ -627,6 +699,8 @@ class LiveSparseTargetDrafter:
         import torch
 
         assert self.model is not None and self.device is not None
+        if self.cascade is not None:
+            return self._generate_cascade(packed, seed_token_id)
         visible = int(packed.keys.shape[-2])
         cache = dynamic_cache_from_packed(self.model.config, packed)
         seed = torch.tensor([[seed_token_id]], device=self.device, dtype=torch.long)
@@ -716,6 +790,117 @@ class LiveSparseTargetDrafter:
                 sequence = sequence[: stop + 1]
             complete[root] = tuple(sequence)
         return complete[roots[0]], complete
+
+    def _generate_cascade(
+        self, packed: PackedTargetKV, seed_token_id: int
+    ) -> tuple[tuple[int, ...], dict[int, tuple[int, ...]]]:
+        """Use a KV-block proposal and parallel sparse-Target correction.
+
+        The small block model prepares all KV-dependent state once.  A single
+        sparse-Target step determines the first post-seed token, the causal
+        reranker conditions its remaining block on that token, and one
+        parallel sparse-Target forward accepts the reranked prefix plus its
+        first correction.  This is an internal speculative level only: the
+        ordinary complete-KV vLLM Target remains the sole committing verifier.
+        """
+
+        import torch
+
+        assert self.model is not None and self.device is not None
+        assert self.cascade is not None
+        visible = int(packed.keys.shape[-2])
+        seed = torch.tensor([[seed_token_id]], device=self.device, dtype=torch.long)
+        selected_keys = packed.keys[:, self.cascade_layers]
+        selected_values = packed.values[:, self.cascade_layers]
+        embedding = self.model.model.embed_tokens
+        lm_head = self.model.lm_head
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            prepared = self.cascade.prepare_rerank_block(
+                seed,
+                embedding,
+                lm_head,
+                selected_keys,
+                selected_values,
+                packed.positions,
+                packed.prompt_tokens,
+                length=self.draft_tokens,
+            )
+
+            cache = dynamic_cache_from_packed(self.model.config, packed)
+            first = self.model(
+                input_ids=seed,
+                attention_mask=torch.ones(
+                    (1, visible + 1), device=self.device, dtype=torch.long
+                ),
+                position_ids=torch.tensor(
+                    [[packed.prompt_tokens]], device=self.device, dtype=torch.long
+                ),
+                cache_position=torch.tensor(
+                    [visible], device=self.device, dtype=torch.long
+                ),
+                past_key_values=cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            root = first.logits[:, -1].argmax(dim=-1, keepdim=True)
+            repaired = self.cascade.propose_prepared_rerank(
+                prepared,
+                embedding,
+                lm_head,
+                first_target_token=root,
+            )
+
+            root_id = int(root.item())
+            if repaired.shape[1] == 0 or root_id in self.eos_ids:
+                sequence = (root_id,)
+                return sequence, {root_id: sequence}
+
+            # With prompt+seed already cached, logits at input token root
+            # predict repaired[0].  Supplying repaired[:-1] verifies every
+            # remaining proposal in one parallel Target forward.
+            verify_input = torch.cat((root, repaired[:, :-1]), dim=1)
+            verify_len = int(verify_input.shape[1])
+            verified = self.model(
+                input_ids=verify_input,
+                attention_mask=torch.ones(
+                    (1, visible + 1 + verify_len),
+                    device=self.device,
+                    dtype=torch.long,
+                ),
+                position_ids=torch.arange(
+                    packed.prompt_tokens + 1,
+                    packed.prompt_tokens + 1 + verify_len,
+                    device=self.device,
+                ).unsqueeze(0),
+                cache_position=torch.arange(
+                    visible + 1,
+                    visible + 1 + verify_len,
+                    device=self.device,
+                ),
+                past_key_values=first.past_key_values,
+                use_cache=False,
+                return_dict=True,
+            )
+            sparse_target = verified.logits.argmax(dim=-1)
+
+        repaired_ids = [int(value) for value in repaired[0].tolist()]
+        target_ids = [int(value) for value in sparse_target[0].tolist()]
+        accepted = 0
+        for candidate, target in zip(repaired_ids, target_ids, strict=True):
+            if candidate != target:
+                break
+            accepted += 1
+        suffix = repaired_ids[:accepted]
+        if accepted < len(target_ids):
+            suffix.append(target_ids[accepted])
+        sequence_list = [root_id, *suffix]
+        for index, token in enumerate(sequence_list):
+            if token in self.eos_ids:
+                sequence_list = sequence_list[: index + 1]
+                break
+        sequence = tuple(sequence_list)
+        return sequence, {root_id: sequence}
 
     def _warmup(self) -> None:
         import torch
@@ -827,7 +1012,7 @@ class LiveSparseTargetDrafter:
                 actual_fraction=packed.positions.numel() / packed.prompt_tokens,
                 root_branches=root_branches,
             )
-            _REGISTRY.publish(draft)
+            _publish_for_early_dispatch(mailbox, draft)
             if self.trace_path:
                 _append_trace(
                     self.trace_path,
@@ -847,6 +1032,12 @@ class LiveSparseTargetDrafter:
                         ],
                         "model": str(self.model_path),
                         "layers": list(self.layers),
+                        "cascade_checkpoint": (
+                            str(self.cascade_checkpoint)
+                            if self.cascade_checkpoint is not None
+                            else None
+                        ),
+                        "cascade_layers": list(self.cascade_layers),
                     },
                 )
         except Exception as error:  # noqa: BLE001
@@ -876,17 +1067,187 @@ class LiveSparseTargetDrafter:
             self._thread.join(timeout=10)
 
 
+def ready_draft_from_external_payload(
+    row: dict[str, Any], *, received_ns: int
+) -> ReadyDraft:
+    """Validate a sidecar proposal packet before publishing it to vLLM."""
+
+    request_id = str(row.get("request_id", ""))
+    pd_request_id = str(row.get("pd_request_id", ""))
+    prompt_tokens = row.get("prompt_tokens")
+    seed_token_id = row.get("seed_token_id")
+    raw_proposals = row.get("proposals")
+    if not request_id or not pd_request_id:
+        raise ValueError("external draft requires both request IDs")
+    if (
+        isinstance(prompt_tokens, bool)
+        or not isinstance(prompt_tokens, int)
+        or prompt_tokens <= 0
+    ):
+        raise ValueError("external draft prompt_tokens must be positive")
+    if isinstance(seed_token_id, bool) or not isinstance(seed_token_id, int):
+        raise TypeError("external draft seed_token_id must be an integer")
+    if (
+        not isinstance(raw_proposals, list)
+        or not raw_proposals
+        or any(
+            isinstance(token, bool) or not isinstance(token, int)
+            for token in raw_proposals
+        )
+    ):
+        raise ValueError("external draft proposals must be nonempty integer IDs")
+    proposals = tuple(raw_proposals)
+    source_started_ns = int(row.get("draft_started_ns", received_ns))
+    source_finished_ns = int(row.get("draft_finished_ns", received_ns))
+    if source_finished_ns < source_started_ns:
+        raise ValueError("external draft timestamps are reversed")
+    # perf_counter_ns() has no cross-host epoch.  The registry and scheduler
+    # must therefore use a D-local timestamp; source timestamps are retained
+    # only as a same-host duration below and in the receive trace.
+    source_wall_ms = (source_finished_ns - source_started_ns) / 1e6
+    return ReadyDraft(
+        request_id=request_id,
+        pd_request_id=pd_request_id,
+        prompt_tokens=prompt_tokens,
+        seed_token_id=seed_token_id,
+        proposals=proposals,
+        anchor_received_ns=received_ns,
+        draft_started_ns=received_ns,
+        draft_finished_ns=received_ns,
+        pack_gpu_ms=0.0,
+        model_gpu_ms=float(row.get("model_ms", 0.0)),
+        total_gpu_ms=float(row.get("model_ms", 0.0)),
+        wall_ms=float(row.get("wall_ms", source_wall_ms)),
+        visible_tokens=prompt_tokens,
+        actual_fraction=1.0,
+        root_branches={proposals[0]: proposals},
+    )
+
+
+class LiveExternalDrafter:
+    """Receive a cheap-model proposal produced outside the Target D worker."""
+
+    def __init__(
+        self,
+        *,
+        layers: tuple[int, ...],
+        draft_tokens: int,
+        trace_path: str,
+    ) -> None:
+        del layers
+        self.draft_tokens = draft_tokens
+        self.trace_path = trace_path
+        self._socket = None
+        self._thread: threading.Thread | None = None
+        self._closed = False
+
+    def load_model(self, target_model: Any) -> None:
+        """Start the control listener; no draft weights are loaded on D."""
+
+        del target_model
+        if self._thread is not None:
+            return
+        import socket
+
+        endpoint = os.environ.get(
+            "SPARSECACHE_EXTERNAL_DRAFT_LISTEN", "udp://127.0.0.1:17620"
+        )
+        if not endpoint.startswith("udp://") or ":" not in endpoint[6:]:
+            raise ValueError("external draft endpoint must be udp://HOST:PORT")
+        host, raw_port = endpoint[6:].rsplit(":", 1)
+        port = int(raw_port)
+        if not host or not 0 < port < 65536:
+            raise ValueError("invalid external draft endpoint")
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._socket.settimeout(0.2)
+        self._socket.bind((host, port))
+        self._thread = threading.Thread(
+            target=self._listen,
+            daemon=True,
+            name="sparsecache-external-draft-listener",
+        )
+        self._thread.start()
+
+    def _listen(self) -> None:
+        assert self._socket is not None
+        while not self._closed:
+            try:
+                payload, _ = self._socket.recvfrom(65535)
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            received_ns = time.perf_counter_ns()
+            try:
+                row = json.loads(payload)
+                if row.get("event") != "external_draft":
+                    continue
+                draft = ready_draft_from_external_payload(
+                    row, received_ns=received_ns
+                )
+                if len(draft.proposals) > self.draft_tokens:
+                    raise ValueError("external proposal exceeds configured horizon")
+                _REGISTRY.publish(draft)
+                _notify_draft_ready(draft)
+                if self.trace_path:
+                    _append_trace(
+                        self.trace_path,
+                        {
+                            "event": "live_external_draft",
+                            "request_id": draft.request_id,
+                            "pd_request_id": draft.pd_request_id,
+                            "prompt_tokens": draft.prompt_tokens,
+                            "seed_token_id": draft.seed_token_id,
+                            "proposals": list(draft.proposals),
+                            "received_ns": received_ns,
+                            "source_draft_started_ns": row.get("draft_started_ns"),
+                            "source_draft_finished_ns": row.get("draft_finished_ns"),
+                            "source": row.get("source", "external_small_model"),
+                            "model_ms": draft.model_gpu_ms,
+                            "wall_ms": draft.wall_ms,
+                        },
+                    )
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                if self.trace_path:
+                    _append_trace(
+                        self.trace_path,
+                        {
+                            "event": "live_external_draft_error",
+                            "received_ns": received_ns,
+                            "error": repr(error),
+                        },
+                    )
+
+    def submit(self, mailbox: Any, row: dict[str, Any]) -> None:
+        """External drafting is request-driven and does not consume Anchor KV."""
+
+        del mailbox, row
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._socket is not None:
+            self._socket.close()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+
 _SERVICE_LOCK = threading.Lock()
-_SERVICE: LiveSparseDrafter | LiveSparseTargetDrafter | None = None
+_SERVICE: LiveSparseDrafter | LiveSparseTargetDrafter | LiveExternalDrafter | None = None
 
 
-def get_online_drafter() -> LiveSparseDrafter | LiveSparseTargetDrafter | None:
+def get_online_drafter() -> (
+    LiveSparseDrafter | LiveSparseTargetDrafter | LiveExternalDrafter | None
+):
     """Return the process-local service, creating it from explicit env only."""
 
     global _SERVICE
     kind = os.environ.get("SPARSECACHE_DRAFTER_KIND", "block")
-    if kind not in {"block", "target"}:
-        raise ValueError("SPARSECACHE_DRAFTER_KIND must be block or target")
+    if kind not in {"block", "target", "external"}:
+        raise ValueError(
+            "SPARSECACHE_DRAFTER_KIND must be block, target, or external"
+        )
     checkpoint = os.environ.get("SPARSECACHE_DRAFTER_CHECKPOINT", "")
     target_path = os.environ.get("SPARSECACHE_TARGET_DRAFTER_MODEL", "")
     if kind == "block" and not checkpoint:
@@ -909,8 +1270,10 @@ def get_online_drafter() -> LiveSparseDrafter | LiveSparseTargetDrafter | None:
             }
             if kind == "block":
                 _SERVICE = LiveSparseDrafter(checkpoint, **common)
-            else:
+            elif kind == "target":
                 _SERVICE = LiveSparseTargetDrafter(target_path, **common)
+            else:
+                _SERVICE = LiveExternalDrafter(**common)
         return _SERVICE
 
 
@@ -928,7 +1291,8 @@ class OnlineSparseKVProposer:
         if self.service is None:
             raise ValueError(
                 "configure SPARSECACHE_DRAFTER_CHECKPOINT for block mode or "
-                "SPARSECACHE_TARGET_DRAFTER_MODEL for target mode"
+                "SPARSECACHE_TARGET_DRAFTER_MODEL for target mode; external "
+                "mode requires SPARSECACHE_EXTERNAL_DRAFT_LISTEN"
             )
         self._pending_feedback: list[PendingVerify] = []
 

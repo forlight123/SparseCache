@@ -41,6 +41,7 @@ class ClaimedLayerViews:
     prompt_tokens: int
     layers: tuple[int, ...]
     views: dict[int, list[Any]]
+    owners_by_layer: dict[int, list[Any]] | None = None
     _released: bool = False
 
     def release(self) -> None:
@@ -139,6 +140,8 @@ def inspect_anchor_message(
         "seed_record": message.get("seed_record"),
         "remote_indexes": list(message.get("remote_indexes") or ()),
         "chunk_indices": list(message.get("chunk_indices") or ()),
+        "object_layers": list(message.get("object_layers") or ()),
+        "object_chunk_indices": list(message.get("object_chunk_indices") or ()),
         "token_ranges": [
             [int(start), int(end)] for start, end in (message.get("token_ranges") or ())
         ],
@@ -150,6 +153,42 @@ def inspect_anchor_message(
             and not missing
             and logical_bytes == expected_resident_bytes
         ),
+    }
+
+
+def inspect_layer_ready_message(
+    backend: Any,
+    message: dict[str, Any],
+    *,
+    received_ns: int | None = None,
+) -> dict[str, Any]:
+    """Validate one sender-side NIXL completion before making keys readable."""
+
+    if message.get("event") != "layer_ready":
+        raise ValueError("expected a layer_ready notification")
+    layer = message.get("layer")
+    if isinstance(layer, bool) or not isinstance(layer, int) or layer < 0:
+        raise ValueError("layer_ready notification has an invalid layer")
+    if received_ns is None:
+        received_ns = time.perf_counter_ns()
+    requested_keys = [str(key) for key in message.get("keys") or ()]
+    with backend.data_lock:
+        resident = {key.to_string(): obj for key, obj in backend.data.items()}
+        objects = [resident.get(key) for key in requested_keys]
+    complete = bool(requested_keys) and all(obj is not None for obj in objects)
+    resolved_bytes = sum(
+        int(obj.get_size()) for obj in objects if obj is not None
+    )
+    expected_bytes = int(message.get("bytes", 0))
+    return {
+        **message,
+        "event": "receiver_layer_ready",
+        "receiver_received_ns": received_ns,
+        "resolved_bytes": resolved_bytes,
+        "missing_keys": [
+            key for key, obj in zip(requested_keys, objects, strict=True) if obj is None
+        ],
+        "complete": complete and resolved_bytes == expected_bytes,
     }
 
 
@@ -175,6 +214,8 @@ class AnchorMailbox:
         self.online_drafter = get_online_drafter()
         self._condition = threading.Condition()
         self._records: dict[str, dict[str, Any]] = {}
+        self._layer_records: dict[tuple[str, int], dict[str, Any]] = {}
+        self.backend._sparsecache_ready_keys = set()
         self._running = True
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket.settimeout(0.2)
@@ -197,6 +238,26 @@ class AnchorMailbox:
             received_ns = time.perf_counter_ns()
             try:
                 message = json.loads(payload)
+                if message.get("event") == "layer_ready":
+                    row = inspect_layer_ready_message(
+                        self.backend, message, received_ns=received_ns
+                    )
+                    if row["complete"]:
+                        with self._condition:
+                            self.backend._sparsecache_ready_keys.update(row["keys"])
+                            if row.get("layer_complete", False):
+                                for identifier in (
+                                    row.get("request_id"),
+                                    row.get("pd_request_id"),
+                                ):
+                                    if identifier:
+                                        self._layer_records[
+                                            (str(identifier), int(row["layer"]))
+                                        ] = row
+                            self._condition.notify_all()
+                    if self.trace_path:
+                        _append_trace(self.trace_path, row)
+                    continue
                 deadline = time.perf_counter() + self.lookup_timeout_ms / 1000
                 while True:
                     row = inspect_anchor_message(
@@ -222,9 +283,11 @@ class AnchorMailbox:
                             aliases = all(
                                 view.untyped_storage().data_ptr()
                                 == owner.tensor.untyped_storage().data_ptr()
-                                for views in claim.views.values()
+                                for layer, views in claim.views.items()
                                 for view, owner in zip(
-                                    views, claim.objects, strict=True
+                                    views,
+                                    (claim.owners_by_layer or {})[layer],
+                                    strict=True,
                                 )
                             )
                         finally:
@@ -242,6 +305,11 @@ class AnchorMailbox:
                         }
                 self.publish(row)
                 if row["complete"] and self.online_drafter is not None:
+                    with self._condition:
+                        self.backend._sparsecache_ready_keys.update(
+                            str(key) for key in message.get("keys") or ()
+                        )
+                        self._condition.notify_all()
                     self.online_drafter.submit(self, row)
             # UDP is an external control plane. A malformed notification must
             # be traced without terminating the mailbox for subsequent work.
@@ -288,6 +356,24 @@ class AnchorMailbox:
             return []
         return self._claim_record_objects(record)
 
+    def wait_layer(
+        self,
+        request_id: str,
+        layer: int,
+        timeout: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Wait until all residual keys needed by one Target layer are written."""
+
+        key = (request_id, layer)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while key not in self._layer_records:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return None
+                self._condition.wait(remaining)
+            return self._layer_records[key]
+
     def _claim_record_objects(self, record: dict[str, Any]) -> list[Any]:
         keys = [entry["key"] for entry in record["objects"]]
         with self.backend.data_lock:
@@ -307,6 +393,51 @@ class AnchorMailbox:
         if not objects:
             return None
         try:
+            object_layers = tuple(int(value) for value in record.get("object_layers", ()))
+            object_chunks = tuple(
+                int(value) for value in record.get("object_chunk_indices", ())
+            )
+            if object_layers or object_chunks:
+                if len(object_layers) != len(objects) or len(object_chunks) != len(objects):
+                    raise ValueError("layerwise Anchor manifest is not object-aligned")
+                selected_chunks = tuple(int(value) for value in record["chunk_indices"])
+                views = {layer: [] for layer in layers}
+                owners_by_layer = {layer: [] for layer in layers}
+                by_pair = {
+                    (layer, chunk): obj
+                    for layer, chunk, obj in zip(
+                        object_layers, object_chunks, objects, strict=True
+                    )
+                }
+                for layer in layers:
+                    for chunk in selected_chunks:
+                        obj = by_pair.get((layer, chunk))
+                        if obj is None:
+                            raise ValueError(
+                                f"Anchor is missing layer={layer}, chunk={chunk}"
+                            )
+                        tensor = obj.tensor
+                        if tensor is None or tensor.ndim != 3 or tensor.shape[1] != 2:
+                            raise ValueError(
+                                "layerwise Anchor must expose KV_T2D [T,2,D]"
+                            )
+                        # permute/unsqueeze are metadata-only views.  Preserve the
+                        # historical [2,1,T,D] drafter contract without a gather.
+                        views[layer].append(tensor.permute(1, 0, 2).unsqueeze(1))
+                        owners_by_layer[layer].append(obj)
+                return ClaimedLayerViews(
+                    objects,
+                    selected_chunks,
+                    tuple(
+                        (int(start), int(end))
+                        for start, end in record.get("token_ranges", ())
+                    ),
+                    int(record.get("prompt_tokens", 0)),
+                    layers,
+                    views,
+                    owners_by_layer,
+                )
+
             views = {layer: [] for layer in layers}
             for obj in objects:
                 tensor = obj.tensor
@@ -329,6 +460,7 @@ class AnchorMailbox:
                 int(record.get("prompt_tokens", 0)),
                 layers,
                 views,
+                {layer: list(objects) for layer in layers},
             )
         except BaseException:
             self.release_objects(objects)

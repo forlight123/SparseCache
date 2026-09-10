@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-10",
+  "decision": "stop_sparse_target_kv_adapter_pivot_to_budgeted_model_portfolio",
+  "immutable_target": "/data/models/qwen/Qwen3-8B",
+  "proposal_horizon": 8,
+  "sparse_target_fraction": 0.1,
+  "stopped_revisions": [
+    {
+      "architecture": "same_position_cache_residual",
+      "selection_task": "QMSum:64-127",
+      "best_mean_accepted": 2.90625,
+      "base_mean_accepted": 2.890625,
+      "paired_delta_ci95": [-0.34375, 0.421875]
+    },
+    {
+      "architecture": "block_wise_sparse_target_kv_cross_attention",
+      "selection_task": "QMSum:64-127",
+      "seed_means": [2.5625, 2.328125, 2.5625],
+      "base_mean_accepted": 2.890625,
+      "best_paired_delta_ci95": [-0.71875, 0.03125]
+    }
+  ],
+  "portfolio_candidates": {
+    "Qwen3-0.6B": {
+      "macro_mean_accepted": 3.4635416666666665,
+      "max_task_p95_ms": 52.681,
+      "status": "short_slack_candidate_below_primary_acceptance_gate"
+    },
+    "Qwen3-4B": {
+      "macro_mean_accepted": 4.515625,
+      "max_task_p95_ms": 231.37283235555515,
+      "task_means": {
+        "QMSum": 4.703125,
+        "MultiFieldQA": 5.015625,
+        "Qasper": 3.828125
+      },
+      "status": "passes_offline_proposer_gate_needs_live_confirmation"
+    }
+  },
+  "live_stoploss": {
+    "minimum_requests": 64,
+    "required_output_id_equality": 1.0,
+    "minimum_mean_accepted_suffix": 3.5,
+    "maximum_mean_draft_overrun_ms": 0.0,
+    "minimum_total_speedup": 1.1,
+    "require_positive_paired_saving_ci": true,
+    "require_charged_resource_normalized_control": true
+  }
+}

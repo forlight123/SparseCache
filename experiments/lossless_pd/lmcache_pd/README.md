@@ -18,6 +18,55 @@ drafter directly consumes five layers of Target KV from the arrived Anchor,
 plus the exact first token sampled by the P Target. No proposed token is exposed
 to the client before the normal full-KV Target verifies it.
 
+### External cheap-model proposal bridge
+
+The runtime also supports a lossless external Qwen3-4B proposal sidecar.  This
+is the post-stop-loss main candidate after both learned sparse-Target-KV
+adapter revisions failed their frozen task-unseen acceptance gate.  It does
+not claim that the 4B model itself consumes sparse Target KV.
+
+The proxy starts a `g+1` seed branch on the sidecar when the request arrives,
+in parallel with P.  When P returns its exact seed, a matching branch reuses
+the remaining `g` tokens.  A mismatch triggers a prefix-cached request
+conditioned on the exact P seed.  The proposal is sent to D over a fail-closed
+UDP join; D acknowledges only after publishing it to the existing custom
+proposer registry.  Every returned suffix is still verified by the ordinary
+complete-KV Target before commitment.
+
+Start the sidecar with prefix caching enabled, for example:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+/home/ytm/algorithm/kvreuse/LMCache/.venv-vllm/bin/vllm serve \
+  /data/models/qwen/Qwen3-4B --host 127.0.0.1 --port 18320 \
+  --dtype bfloat16 --max-model-len 8304 --gpu-memory-utilization 0.30 \
+  --enable-prefix-caching --enforce-eager --disable-log-stats
+```
+
+Add these variables to D:
+
+```text
+SPARSECACHE_DRAFTER_KIND=external
+SPARSECACHE_DRAFT_TOKENS=8
+SPARSECACHE_EXTERNAL_DRAFT_LISTEN=udp://127.0.0.1:17620
+SPARSECACHE_DRAFT_NOTIFY=udp://127.0.0.1:17610
+SPARSECACHE_ONLINE_DRAFT_MODE=observe|inject
+```
+
+Add these variables to `layer_ready_proxy.py`:
+
+```text
+SPARSECACHE_EXTERNAL_DRAFT_URL=http://127.0.0.1:18320
+SPARSECACHE_EXTERNAL_DRAFT_MODEL=/data/models/qwen/Qwen3-4B
+SPARSECACHE_EXTERNAL_DRAFT_TOKENS=8
+SPARSECACHE_EXTERNAL_DRAFT_NOTIFY=udp://127.0.0.1:17620
+SPARSECACHE_DRAFT_LISTEN=udp://127.0.0.1:17610
+```
+
+The first live gate uses a third GPU so drafter compute cannot perturb D.  A
+paper result must additionally report resource-normalized throughput and a
+co-located D-side configuration; an uncharged extra GPU is not a valid win.
+
 ## Runtime sequence
 
 1. P samples the exact seed through `SeedSignalProposer`. The proposer itself

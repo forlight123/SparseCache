@@ -6,6 +6,7 @@ import torch
 from experiments.lossless_pd.lmcache_pd.receiver_runtime import (
     AnchorMailbox,
     inspect_anchor_message,
+    inspect_layer_ready_message,
     parse_layers,
     parse_udp_endpoint,
 )
@@ -141,6 +142,35 @@ def test_inspect_anchor_accepts_receiver_deduplicated_keys():
     assert row["resolved_bytes"] == row["expected_resident_bytes"] == 30
 
 
+def test_inspect_layer_ready_requires_resident_objects_and_matching_bytes():
+    row = inspect_layer_ready_message(
+        FakeBackend(),
+        {
+            "event": "layer_ready",
+            "layer": 0,
+            "layer_complete": True,
+            "keys": ["key-a", "key-b"],
+            "bytes": 30,
+        },
+        received_ns=10,
+    )
+    assert row["complete"] is True
+    assert row["resolved_bytes"] == 30
+
+    row = inspect_layer_ready_message(
+        FakeBackend(),
+        {
+            "event": "layer_ready",
+            "layer": 0,
+            "layer_complete": True,
+            "keys": ["key-a", "missing"],
+            "bytes": 30,
+        },
+    )
+    assert row["complete"] is False
+    assert row["missing_keys"] == ["missing"]
+
+
 def test_mailbox_claim_pins_and_release_unpins_objects():
     mailbox = AnchorMailbox.__new__(AnchorMailbox)
     mailbox.backend = FakeBackend()
@@ -187,3 +217,55 @@ def test_mailbox_exposes_ordered_zero_copy_layer_views():
             )
     claim.release()
     assert all(obj.get_ref_count() == 1 for obj in claim.objects)
+
+
+def test_mailbox_exposes_layerwise_anchor_as_zero_copy_legacy_views():
+    backend = FakeBackend()
+    objects = []
+    for layer in (1, 9):
+        for chunk in (0, 2):
+            obj = FakeObject(8, 1000 + layer * 100 + chunk)
+            obj.tensor = torch.empty((128, 2, 4), dtype=torch.bfloat16)
+            key = FakeKey(f"layer-{layer}-chunk-{chunk}")
+            backend.data[key] = obj
+            objects.append((layer, chunk, key, obj))
+
+    message = {
+        "event": "nixl_write",
+        "phase": "anchor",
+        "request_id": "layerwise",
+        "pd_request_id": "pd-layerwise",
+        "keys": [item[2].to_string() for item in objects],
+        "bytes": 32,
+        "resident_bytes": 32,
+        "chunk_indices": [0, 2],
+        "object_layers": [item[0] for item in objects],
+        "object_chunk_indices": [item[1] for item in objects],
+        "token_ranges": [[0, 128], [256, 384]],
+        "prompt_tokens": 512,
+    }
+    mailbox = AnchorMailbox.__new__(AnchorMailbox)
+    mailbox.backend = backend
+    mailbox.trace_path = ""
+    mailbox._condition = threading.Condition()
+    mailbox._records = {}
+    row = inspect_anchor_message(backend, message)
+    mailbox.publish(row)
+
+    claim = mailbox.claim_layer_views("layerwise", (1, 9))
+    assert claim is not None
+    assert len(claim.objects) == 4
+    assert claim.chunk_indices == (0, 2)
+    assert all(len(claim.views[layer]) == 2 for layer in (1, 9))
+    assert all(
+        view.shape == (2, 1, 128, 4)
+        for layer in (1, 9)
+        for view in claim.views[layer]
+    )
+    for layer in (1, 9):
+        for view, owner in zip(
+            claim.views[layer], claim.owners_by_layer[layer], strict=True
+        ):
+            assert view.untyped_storage().data_ptr() == owner.tensor.data_ptr()
+    claim.release()
+    assert all(obj.get_ref_count() == 1 for _, _, _, obj in objects)

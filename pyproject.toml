@@ -13,6 +13,12 @@ dependencies = [
   "transformers>=4.57,<5",
 ]
 
+[dependency-groups]
+dev = [
+  "pytest>=9,<10",
+  "ruff>=0.13,<1",
+]
+
 [project.scripts]
 sparsecache-prepare = "sparsecache.data:main"
 sparsecache-precompute = "sparsecache.precompute:main"
