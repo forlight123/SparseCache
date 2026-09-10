@@ -7,24 +7,26 @@ Status: preregistered working ledger, updated 2026-09-10. A row marked `missing`
 
 The intended claim is narrowly scoped:
 
-> In transfer-bound P/D disaggregation, exact prompt-KV pages can be delivered
-> in priority order and used by a genuinely sparse, same-model draft path while
-> the exact residual is still in flight. One immutable full-KV verifier then
-> preserves the target endpoint and can reduce transition/completion latency.
+> In transfer-bound P/D disaggregation, an exact token-sparse KV Anchor can be
+> used by a genuinely sparse draft path while
+> the exact residual is still in flight. The immutable full-Target verifier
+> executes layer `l` only after that layer's complete exact KV arrives, while
+> later-layer KV may remain in flight. This preserves the Target endpoint and
+> can reduce transition/completion latency.
 
 The method does not claim that independent-document KV composition is repaired,
 that partial KV may be committed without verification, or that mixed-precision
 KV is novel. CacheBlend remains a separate context-reuse baseline. The exact
-policy is `W=infinity`: no draft token is externally committed before complete
-KV arrival and final verification.
+policy is `W=infinity`: no draft token is externally committed before all exact
+Target layers and the final acceptance step complete.
 
 ## 2. Claim ledger
 
 | ID | prospective claim | required evidence | present evidence | status |
 |---|---|---|---|---|
-| C0 | the shared P/D state machine is exact by construction | hidden producer seed; protected prompt boundary arrives in atomic S1; no draft output; full arrival before exactly one verifier; target cache after verify; worker input chain matches scheduler state | real LMCache P/D now supplies exact P seed and registered Anchor views to an online direct-KV drafter; repaired suffixes are committed only after full-KV Target verification; exact token-ID replay matches monolithic on 64/64 greedy requests across observe--inject--observe. A separate P-runahead control is 32/32 equal only at chunk-aligned boundaries and 7/8 at an unaligned boundary, confirming that a bitwise claim also requires canonical transferred state/numerics | 64-request online greedy pilot passed; sampling and cross-boundary bitwise contract pending |
+| C0 | the shared P/D state machine is exact by construction | hidden producer seed; no draft output; every Target layer waits for its complete original KV and exact predecessor hidden state; one immutable acceptance step; worker input chain matches scheduler state | real LMCache P/D supplies exact P seed and registered Anchor views to an online direct-KV drafter; repaired suffixes are committed only after full-KV Target verification; exact token-ID replay matches monolithic on 64/64 greedy requests across observe--inject--observe. The new all-layer probe is bitwise identical between wait-full and layer-ready execution for the same eager block arithmetic. A separate P-runahead control is 32/32 equal only at chunk-aligned boundaries and 7/8 at an unaligned boundary, confirming that a bitwise claim also requires canonical transferred state/numerics | structural mechanism passed; deployed layer-ready state machine, sampling, and cross-shape bitwise contract pending |
 | C1 | draft attention is genuinely sparse and becomes cheaper with context | request-attributed physical page counts, full-model draft time, profiler memory traffic/kernel attribution, and dense-vs-sparse crossover at 16K--128K | the valid trace-isolated 128K `n=30` cell addresses 5.04% of logical BF16 KV but takes 168.92 ms versus 161.05 ms at 100% (`0.953x`, paired saved-time CI `[-16.25, 0.43]` ms). Compact-table reuse improves the implementation, but the preregistered `>=1.10x` crossover is absent. Nsight attributes about 32 ms less attention-kernel work at 5%, yet the generic FA3 compact path adds 256 per-layer scheduling kernels and CPU launch gaps; an AOT-schedule attempt removed those kernels but introduced a roughly 40-ms synchronous schedule build and was reverted | current same-model/page-only path falsified; cheaper-draft pivot required |
-| C2 | overlap improves end-to-end latency in a realistic transfer-bound regime | n=100 paired baseline/fixed/continuous cells at 25/50 Gbps; P50/P95/P99; paired 95% CI; >=1.10x primary speedup | in real one-host LMCache, an exact-token `n=64` observe--inject--observe sandwich saves 24.407 ms total latency, CI [19.513,29.671] ms, on 63/64 requests while TTFT is unchanged. The 90-request paced-HF diagnostic selects `g=8` at 82.52 ms saving after two explicit stall adjudications, but only that arm is 90/90 output-equal. A fully charged live exact-P `k=4` control is instead 7.05 ms slower than `k=1`, CI [5.33,8.65], on 32 aligned requests | positive sparse-D mechanism pilot; exact-P analytical shortcut falsified; primary paper gate pending |
+| C2 | sparse drafting and layer-ready exact verification jointly improve latency in a realistic transfer-bound regime | n=100 paired cells at 25/50 Gbps; wait-full/layer-ready x no-draft/sparse-draft; P50/P95/P99; paired 95% CI; >=1.10x primary speedup | a within-process, order-balanced 100-Gbps 2x2 H200 probe hides 48.83 ms in the sparse arm, CI [47.26,49.91], and reaches 1.733x mean per-request equal-progress speedup. Its difference-in-differences is 0.099 ms, CI [-0.545,0.681], showing that layer-ready and proposal-progress gains are not double-counted. Preliminary 25/50-Gbps layer-ready cells reach 1.226x/1.419x ratio-of-means and zero draft overrun. All cells have one eager block-vs-sequential mismatch request and only n=64 | positive structural mechanism; n=100 exact-output and real two-node gates pending |
 | C3 | continuous page arrival is better than fixed S1 | fresh confirmation split; >=2 accepted tokens or >=20% relative acceptance gain; paired latency CI excludes zero; matched bytes/quality | the valid shared-prefill 64K/25-Gbps `n=30` screen found zero useful-acceptance differences in all 150 schedule-request pairs; all five latency CIs cross zero. A follow-up 1%-tranche, `gamma=16`, `n=10` screen made 6--8 visibility levels observable in every continuous request and changed 8/50 draft token sequences, but changed useful accepted tokens in 0/50 pairs. Its 100-bundle transfer also accumulated about 0.23--1.33 s of observed fragmentation/control overhead above the 2.749-s modeled wire | multi-level continuous contribution falsified at both coarse and fine granularity; fixed-anchor pivot |
 | C4 | page order controls proposal quality | five matched RULER layouts and request-paired sequential/uniform/random/BM25/oracle schedules at fixed bytes/deadlines; acceptance and latency interaction | all gates pass on the shared-prefill 64K/25-Gbps `n=30` screen. EOS-aware useful acceptance is 39.67% sequential, 2.48% uniform, 4.96% random, and 7.44% for both BM25 and oracle. Offline evidence coverage therefore does not predict sparse next-token alignment; semantic ordering is not presently supported as a contribution | valid negative screen; contribution at risk |
 | C5 | the exact endpoint preserves task quality | 100% greedy token equality primary gate; official LongBench/LongBench-v2 metrics; per-dataset paired deltas | strict native-length QMSum packet replay gives 64/64 monolithic greedy equality; an earlier 59/64 text replay is superseded because retokenization changed the input; official task-diverse quality remains unrun | exact pilot passed; paper quality missing |
@@ -39,8 +41,9 @@ All primary latency comparisons use fixed 32 output tokens, greedy decoding,
 one request at a time, alternating three-arm order, and no outlier removal.
 
 1. A cell is invalid unless every request passes the complete paired matrix,
-   unique request ID, fixed output horizon, one verifier, full-before-verify,
-   request-attributed sparse-attention, fair-link, and exact-output gates.
+   unique request ID, natural output horizon, one immutable verifier, complete
+   same-layer KV before each Target layer, request-attributed sparse attention,
+   fair-link, and exact-output gates.
 2. Primary feasibility passes only when `baseline - continuous` completion
    latency has a positive 10,000-sample paired-bootstrap 95% CI and mean
    speedup is at least 1.10x at 25 or 50 Gbps.
@@ -67,7 +70,7 @@ one request at a time, alternating three-arm order, and no outlier removal.
 | fixed S1 | overlap without progressive masks | identical anchor, bytes, draft cap, verifier |
 | continuous arrival mask | incremental metadata-only visibility | fixed S1 vs continuous |
 | dense draft mask | sparse-kernel contribution | same state machine with full prompt pages |
-| no overlap | pipeline contribution | same operations serialized |
+| wait-full verifier | layer-ready exact-verifier contribution | same proposal, Target arithmetic, bytes, progress, requests, and four-arm rotated order |
 | random/sequential/uniform/BM25/query/oracle order | scheduling contribution and upper bound | fixed anchor bytes and wire trace |
 | gamma 4/8/16/32 | proposal/verification tradeoff | matched requests and bandwidth |
 | anchor 2/5/10/20% | first-visible working set | matched total bytes |

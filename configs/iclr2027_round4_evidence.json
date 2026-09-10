@@ -1,0 +1,60 @@
+{
+  "round_id": "structural-revision-20260910",
+  "method_contract": {
+    "token_sparse_anchor": true,
+    "draft_hidden_until_target_verify": true,
+    "full_precision_target_kv_eventually_transferred": true,
+    "single_immutable_target_verifier": true,
+    "layer_ready_exact_target": true
+  },
+  "layer_ready_verifier": {
+    "result": "../outputs/progressive_kv/iclr2027_20260909/verifier_n64_gpu2/results.json"
+  },
+  "proposer_evaluations": [
+    {
+      "task": "QMSum",
+      "result": "../outputs/progressive_kv/iclr2027_20260909/eval_qmsum_summary5_h256_g7_diag.json",
+      "cell": "priority/f0.1/exact",
+      "proposal_horizon": 7,
+      "natural_output_min_tokens": 7,
+      "task_unseen": false
+    },
+    {
+      "task": "MultiNews",
+      "result": "../outputs/progressive_kv/iclr2027_20260909/eval_multinews_summary5_h256_g7_diag.json",
+      "cell": "priority/f0.1/exact",
+      "proposal_horizon": 7,
+      "natural_output_min_tokens": 7,
+      "task_unseen": false
+    },
+    {
+      "task": "GovReport",
+      "result": "../outputs/progressive_kv/iclr2027_20260909/eval_govreport_summary5_h256_g7_diag.json",
+      "cell": "priority/f0.1/exact",
+      "proposal_horizon": 7,
+      "natural_output_min_tokens": 7,
+      "task_unseen": false
+    }
+  ],
+  "integrated_proxy_runs": [
+    {
+      "result": "../outputs/progressive_kv/iclr2027_20260910/ablation_layer_ready_25g_g7_n64_r3/results.json"
+    },
+    {
+      "result": "../outputs/progressive_kv/iclr2027_20260910/ablation_layer_ready_50g_g7_n64_r3/results.json"
+    },
+    {
+      "result": "../outputs/progressive_kv/iclr2027_20260910/ablation_interleaved_100g_g7_n64_r3/layer_ready_results.json"
+    }
+  ],
+  "live_two_node_runs": [],
+  "paper_breadth": {
+    "target_models": 1,
+    "task_unseen_tasks": 0
+  },
+  "budget": {
+    "proposer_architecture_revisions": 0,
+    "proposer_gpu_hours": 0,
+    "live_optimization_rounds": 0
+  }
+}

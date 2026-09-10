@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import queue
 import statistics
 import threading
@@ -32,7 +31,6 @@ from experiments.lossless_pd.shape_invariant_attention import (
 )
 from experiments.lossless_pd.verifier_probe import cache_with_buffers
 
-
 LAYER_IDS = [1, 9, 17, 25, 33]
 
 
@@ -41,7 +39,9 @@ def load_drafter(checkpoint):
     model = ProgressiveBlock(BlockKVDraft.load_checkpoint(checkpoint))
     stage = checkpoint / "stage.pt"
     if stage.exists():
-        model.stage.load_state_dict(torch.load(stage, map_location="cpu", weights_only=True))
+        model.stage.load_state_dict(
+            torch.load(stage, map_location="cpu", weights_only=True)
+        )
     return model.to("cuda", dtype=torch.bfloat16).eval()
 
 
@@ -50,8 +50,8 @@ def wait_until(deadline):
         remaining = deadline - time.perf_counter()
         if remaining <= 0:
             return
-        if remaining > .0003:
-            time.sleep(remaining - .00015)
+        if remaining > 0.0003:
+            time.sleep(remaining - 0.00015)
 
 
 def producer(copy_stream, origin, started, gbps, transfers, output_queue, scatter=None):
@@ -83,22 +83,34 @@ def producer(copy_stream, origin, started, gbps, transfers, output_queue, scatte
             # crossed the emulated wire. The CUDA event separately guards a
             # real H2D copy that is slower than the configured link.
             wait_until(started + cumulative / bytes_per_second)
-            output_queue.put((name, ready, payload, None))
-    except BaseException as error:  # propagate instead of deadlocking the consumer
-        output_queue.put(("error", None, 0, error))
+            output_queue.put((name, ready, payload, time.perf_counter(), None))
+    except Exception as error:  # noqa: BLE001 - propagate worker failures
+        output_queue.put(("error", None, 0, time.perf_counter(), error))
 
 
 def next_event(output_queue, expected):
-    name, event, payload, error = output_queue.get()
+    name, event, payload, published_at, error = output_queue.get()
     if error is not None:
         raise error
     if name != expected:
         raise RuntimeError(f"transfer order mismatch: expected {expected}, got {name}")
-    return event, payload
+    return event, payload, published_at
 
 
-def target_block(target, block, cache, output_queue, bitwise_verifier=False):
+def target_block(
+    target,
+    block,
+    cache,
+    output_queue,
+    origin,
+    started,
+    bitwise_verifier=False,
+    target_start_mode="layer_ready",
+):
     """Run exact target layers, waiting only for each layer's full prompt KV."""
+
+    if target_start_mode not in {"layer_ready", "full_ready"}:
+        raise ValueError(f"unsupported target start mode: {target_start_mode}")
 
     n = cache.layers[0].keys.shape[-2]
     length = block.shape[1]
@@ -110,23 +122,58 @@ def target_block(target, block, cache, output_queue, bitwise_verifier=False):
     mask.masked_fill_(~allowed, torch.finfo(hidden.dtype).min)
     compute = torch.cuda.current_stream()
     ready_events = []
+    published_ms = []
+    layer_times = []
     bytes_received = 0
-    exact_ops = row_invariant_verifier_ops(target) if bitwise_verifier else nullcontext()
+    if target_start_mode == "full_ready":
+        for layer_id in range(len(target.model.layers)):
+            ready, payload, published_at = next_event(output_queue, f"layer{layer_id}")
+            ready_events.append(ready)
+            published_ms.append((published_at - started) * 1000)
+            bytes_received += payload
+        compute.wait_event(ready_events[-1])
+    exact_ops = (
+        row_invariant_verifier_ops(target) if bitwise_verifier else nullcontext()
+    )
     with exact_ops:
         for layer_id, layer in enumerate(target.model.layers):
-            ready, payload = next_event(output_queue, f"layer{layer_id}")
-            ready_events.append(ready)
-            bytes_received += payload
-            compute.wait_event(ready)
-            hidden = layer(hidden, attention_mask=mask, position_ids=positions[None],
-                           past_key_values=cache, use_cache=True, cache_position=positions,
-                           position_embeddings=rotary)
+            if target_start_mode == "layer_ready":
+                ready, payload, published_at = next_event(
+                    output_queue, f"layer{layer_id}"
+                )
+                ready_events.append(ready)
+                published_ms.append((published_at - started) * 1000)
+                bytes_received += payload
+                compute.wait_event(ready)
+            begin = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            begin.record(compute)
+            hidden = layer(
+                hidden,
+                attention_mask=mask,
+                position_ids=positions[None],
+                past_key_values=cache,
+                use_cache=True,
+                cache_position=positions,
+                position_embeddings=rotary,
+            )
+            end.record(compute)
+            layer_times.append((begin, end))
         logits = target.lm_head(target.model.norm(hidden)).float()
-    return logits, cache, ready_events, bytes_received
+    return (
+        logits,
+        cache,
+        {
+            "ready_events": ready_events,
+            "published_ms": published_ms,
+            "layer_times": layer_times,
+            "bytes_received": bytes_received,
+        },
+    )
 
 
 def contiguous_ranges(positions, length, selected):
-    chosen = set(int(value) for value in positions.cpu().tolist())
+    chosen = {int(value) for value in positions.cpu().tolist()}
     flags = [(index in chosen) == selected for index in range(length)]
     ranges, start = [], None
     for index, include in enumerate(flags + [False]):
@@ -148,10 +195,24 @@ def sliced_pairs(destination, source, ranges):
 
 
 @torch.no_grad()
-def run_condition(target, drafter, host, anchor, seed, prompt_tokens, positions,
-                   gbps, proposal_tokens, condition, verifier_semantics="eager"):
-    target_buffers = [(torch.empty_like(key, device="cuda"),
-                       torch.empty_like(value, device="cuda")) for key, value in host]
+def run_condition(
+    target,
+    drafter,
+    host,
+    anchor,
+    seed,
+    prompt_tokens,
+    positions,
+    gbps,
+    proposal_tokens,
+    condition,
+    verifier_semantics="eager",
+    target_start_mode="layer_ready",
+):
+    target_buffers = [
+        (torch.empty_like(key, device="cuda"), torch.empty_like(value, device="cuda"))
+        for key, value in host
+    ]
     cache = cache_with_buffers(target, target_buffers)
     copy_stream = torch.cuda.Stream()
     compute = torch.cuda.current_stream()
@@ -161,8 +222,10 @@ def run_condition(target, drafter, host, anchor, seed, prompt_tokens, positions,
     anchor_buffers = None
     scatter = None
     if condition == "speculative":
-        anchor_buffers = (torch.empty_like(anchor[0], device="cuda"),
-                          torch.empty_like(anchor[1], device="cuda"))
+        anchor_buffers = (
+            torch.empty_like(anchor[0], device="cuda"),
+            torch.empty_like(anchor[1], device="cuda"),
+        )
         transfers.append(("anchor", anchor_buffers, anchor))
         missing_ranges = contiguous_ranges(positions, prompt_tokens, False)
         scatter = (target_buffers, anchor_buffers, positions)
@@ -175,28 +238,40 @@ def run_condition(target, drafter, host, anchor, seed, prompt_tokens, positions,
                 destinations, sources = target_buffers[layer_id], host[layer_id]
             transfers.append((f"layer{layer_id}", destinations, sources))
     else:
-        transfers.extend((f"layer{layer_id}", target_buffers[layer_id], host[layer_id])
-                         for layer_id in range(len(host)))
+        transfers.extend(
+            (f"layer{layer_id}", target_buffers[layer_id], host[layer_id])
+            for layer_id in range(len(host))
+        )
     torch.cuda.synchronize()
     origin.record(compute)
     started = time.perf_counter()
-    worker = threading.Thread(target=producer, args=(
-        copy_stream, origin, started, gbps, transfers, events, scatter
-    ), daemon=True)
+    worker = threading.Thread(
+        target=producer,
+        args=(copy_stream, origin, started, gbps, transfers, events, scatter),
+        daemon=True,
+    )
     worker.start()
     bytes_sent = 0
     draft_ms = 0.0
+    anchor_ready_ms = None
+    draft_ready_ms = None
     if condition == "speculative":
-        anchor_ready, payload = next_event(events, "anchor")
+        anchor_ready, payload, anchor_published_at = next_event(events, "anchor")
         bytes_sent += payload
+        anchor_ready_ms = (anchor_published_at - started) * 1000
         compute.wait_event(anchor_ready)
         draft_start = torch.cuda.Event(enable_timing=True)
         draft_end = torch.cuda.Event(enable_timing=True)
         draft_start.record(compute)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             proposals = drafter.propose(
-                seed, target.model.embed_tokens, target.lm_head,
-                anchor_buffers[0], anchor_buffers[1], positions, prompt_tokens,
+                seed,
+                target.model.embed_tokens,
+                target.lm_head,
+                anchor_buffers[0],
+                anchor_buffers[1],
+                positions,
+                prompt_tokens,
                 length=proposal_tokens,
             )
             proposals = proposals[0]
@@ -205,18 +280,36 @@ def run_condition(target, drafter, host, anchor, seed, prompt_tokens, positions,
     else:
         proposals = None
         block = seed
-    logits, cache, layer_events, target_bytes = target_block(
-        target, block, cache, events,
+    logits, cache, target_trace = target_block(
+        target,
+        block,
+        cache,
+        events,
+        origin,
+        started,
         bitwise_verifier=condition == "speculative" and verifier_semantics == "bitwise",
+        target_start_mode=target_start_mode,
     )
-    bytes_sent += target_bytes
+    bytes_sent += target_trace["bytes_received"]
     torch.cuda.synchronize()
     first_commit_ms = (time.perf_counter() - started) * 1000
     worker.join()
-    releases = [origin.elapsed_time(event) for event in layer_events]
+    releases = [origin.elapsed_time(event) for event in target_trace["ready_events"]]
+    layer_times = [
+        {
+            "start_ms": origin.elapsed_time(begin),
+            "finish_ms": origin.elapsed_time(end),
+            "cost_ms": begin.elapsed_time(end),
+        }
+        for begin, end in target_trace["layer_times"]
+    ]
+    full_kv_ready_ms = target_trace["published_ms"][-1]
     if condition == "speculative":
         draft_ms = draft_start.elapsed_time(draft_end)
-        committed, accepted = greedy_commit(proposals.tolist(), logits.argmax(-1)[0].tolist())
+        draft_ready_ms = origin.elapsed_time(draft_end)
+        committed, accepted = greedy_commit(
+            proposals.tolist(), logits.argmax(-1)[0].tolist()
+        )
         same_progress_ms = first_commit_ms
     else:
         accepted = None
@@ -230,6 +323,23 @@ def run_condition(target, drafter, host, anchor, seed, prompt_tokens, positions,
         "committed": committed,
         "accepted": accepted,
         "draft_ms": draft_ms,
+        "anchor_ready_ms": anchor_ready_ms,
+        "draft_ready_ms": draft_ready_ms,
+        "full_kv_ready_ms": full_kv_ready_ms,
+        "residual_slack_ms": (
+            None
+            if anchor_ready_ms is None
+            else max(0.0, full_kv_ready_ms - anchor_ready_ms)
+        ),
+        "draft_overrun_ms": (
+            None
+            if draft_ready_ms is None
+            else max(0.0, draft_ready_ms - full_kv_ready_ms)
+        ),
+        "target_started_before_full_kv": layer_times[0]["start_ms"] < full_kv_ready_ms,
+        "target_first_layer_start_ms": layer_times[0]["start_ms"],
+        "target_last_layer_finish_ms": layer_times[-1]["finish_ms"],
+        "target_layer_times": layer_times,
         "bytes_sent": bytes_sent,
         "layer_release_ms": releases,
         "cache": cache,
@@ -270,12 +380,16 @@ def summarize(rows, args):
         rows, lambda row: row["speculative"]["same_progress_ms"]
     )
     deltas = clustered_values(
-        rows, lambda row: row["baseline"]["same_progress_ms"]
-        - row["speculative"]["same_progress_ms"]
+        rows,
+        lambda row: (
+            row["baseline"]["same_progress_ms"] - row["speculative"]["same_progress_ms"]
+        ),
     )
     first = clustered_values(
-        rows, lambda row: row["speculative"]["first_commit_ms"]
-        - row["baseline"]["first_commit_ms"]
+        rows,
+        lambda row: (
+            row["speculative"]["first_commit_ms"] - row["baseline"]["first_commit_ms"]
+        ),
     )
     baseline_first = clustered_values(
         rows, lambda row: row["baseline"]["first_commit_ms"]
@@ -283,8 +397,9 @@ def summarize(rows, args):
     speculative_first = clustered_values(
         rows, lambda row: row["speculative"]["first_commit_ms"]
     )
-    mismatch_records = {row["record_id"] for row in rows
-                        if not row["committed_output_equal"]}
+    mismatch_records = {
+        row["record_id"] for row in rows if not row["committed_output_equal"]
+    }
     return {
         "requests": len({row["record_id"] for row in rows}),
         "paired_runs": len(rows),
@@ -293,7 +408,11 @@ def summarize(rows, args):
         "order": args.order,
         "proposal_tokens": args.proposal_tokens,
         "verifier_semantics": args.verifier_semantics,
+        "target_start_mode": args.target_start_mode,
         "mean_progress_tokens": statistics.mean(row["progress_tokens"] for row in rows),
+        "mean_accepted_proposals": statistics.mean(
+            row["speculative"]["accepted"] for row in rows
+        ),
         "mean_baseline_same_progress_ms": statistics.mean(baseline_same),
         "mean_speculative_same_progress_ms": statistics.mean(speculative_same),
         "mean_same_progress_saving_ms": statistics.mean(deltas),
@@ -302,17 +421,40 @@ def summarize(rows, args):
         "mean_baseline_first_commit_ms": statistics.mean(baseline_first),
         "mean_speculative_first_commit_ms": statistics.mean(speculative_first),
         "first_commit_delta_ci95_request_bootstrap_ms": bootstrap_delta(first),
-        "mean_draft_ms": statistics.mean(row["speculative"]["draft_ms"] for row in rows),
+        "mean_draft_ms": statistics.mean(
+            row["speculative"]["draft_ms"] for row in rows
+        ),
+        "mean_residual_slack_ms": statistics.mean(
+            row["speculative"]["residual_slack_ms"] for row in rows
+        ),
+        "mean_draft_overrun_ms": statistics.mean(
+            row["speculative"]["draft_overrun_ms"] for row in rows
+        ),
+        "fraction_speculative_verifier_started_before_full_kv": sum(
+            row["speculative"]["target_started_before_full_kv"] for row in rows
+        )
+        / len(rows),
+        "mean_equal_progress_speedup": statistics.mean(
+            baseline / speculative
+            for baseline, speculative in zip(baseline_same, speculative_same)
+        ),
         "fraction_requests_faster_at_same_progress": sum(value > 0 for value in deltas)
         / len(deltas),
-        "committed_output_mismatch_runs": sum(not row["committed_output_equal"] for row in rows),
+        "committed_output_mismatch_runs": sum(
+            not row["committed_output_equal"] for row in rows
+        ),
         "committed_output_mismatch_requests": len(mismatch_records),
         "committed_output_mismatch_record_ids": sorted(mismatch_records),
-        "mean_baseline_bytes": statistics.mean(row["baseline"]["bytes_sent"] for row in rows),
-        "mean_speculative_bytes": statistics.mean(row["speculative"]["bytes_sent"] for row in rows),
+        "mean_baseline_bytes": statistics.mean(
+            row["baseline"]["bytes_sent"] for row in rows
+        ),
+        "mean_speculative_bytes": statistics.mean(
+            row["speculative"]["bytes_sent"] for row in rows
+        ),
         "contract": (
             "one-host paced-link proxy plus real pinned H2D; actual sparse drafter; "
-            f"actual all-layer {args.verifier_semantics} verifier; anchor bytes reused in full "
+            f"actual all-layer {args.verifier_semantics} verifier with "
+            f"{args.target_start_mode} start; anchor bytes reused in full "
             "target cache; P prefill, "
             "host pinning, allocations, and NIC/RDMA excluded"
         ),
@@ -328,13 +470,25 @@ def main():
     parser.add_argument("--target", default="/data/models/qwen/Qwen3-8B")
     parser.add_argument("--requests", type=int, default=16)
     parser.add_argument("--repeats", type=int, default=2)
-    parser.add_argument("--fraction", type=float, default=.1)
-    parser.add_argument("--order", choices=["priority", "random", "reverse_priority"],
-                        default="priority")
+    parser.add_argument("--fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--order",
+        choices=["priority", "random", "reverse_priority"],
+        default="priority",
+    )
     parser.add_argument("--proposal-tokens", type=int, default=15)
     parser.add_argument("--gbps", type=float, default=100)
     parser.add_argument(
         "--verifier-semantics", choices=["eager", "bitwise"], default="eager"
+    )
+    parser.add_argument(
+        "--target-start-mode",
+        choices=["layer_ready", "full_ready"],
+        default="layer_ready",
+        help=(
+            "start exact Target layers as their full per-layer KV arrives, or "
+            "retain the conventional barrier until the complete KV is ready"
+        ),
     )
     args = parser.parse_args()
     if args.requests <= 0 or args.repeats <= 0 or not 0 < args.fraction <= 1:
@@ -346,22 +500,25 @@ def main():
     target = load_target(args.target)
     target.config._attn_implementation = "eager"
     drafter = load_drafter(args.checkpoint)
-    write_json(output / "manifest.json", {
-        "arguments": {
-            **vars(args),
-            "packets": str(packet_root),
-            "checkpoint": str(Path(args.checkpoint).resolve()),
-            "output": str(output.resolve()),
-            "target": str(Path(args.target).resolve()),
+    write_json(
+        output / "manifest.json",
+        {
+            "arguments": {
+                **vars(args),
+                "packets": str(packet_root),
+                "checkpoint": str(Path(args.checkpoint).resolve()),
+                "output": str(output.resolve()),
+                "target": str(Path(args.target).resolve()),
+            },
+            "drafter_config": asdict(drafter.base.config),
+            "measurement_contract": (
+                "one-host paced-link proxy with real pinned H2D; run timing cells "
+                "serially because concurrent GPUs share host-memory and PCIe resources"
+            ),
         },
-        "drafter_config": asdict(drafter.base.config),
-        "measurement_contract": (
-            "one-host paced-link proxy with real pinned H2D; run timing cells "
-            "serially because concurrent GPUs share host-memory and PCIe resources"
-        ),
-    })
+    )
     rows = []
-    for request_index, entry in enumerate(index["entries"][:args.requests]):
+    for request_index, entry in enumerate(index["entries"][: args.requests]):
         packet = load_packet(packet_root, entry)
         ids = packet["prompt_ids"].to("cuda")
         target.config._attn_implementation = "sdpa"
@@ -369,42 +526,71 @@ def main():
         seed = target.lm_head(prompt.last_hidden_state[:, -1:]).argmax(-1)
         if int(seed.item()) != int(packet["seed"].item()):
             raise RuntimeError("fresh P seed differs from immutable packet")
-        host = [(layer.keys.cpu().pin_memory(), layer.values.cpu().pin_memory())
-                for layer in prompt.past_key_values.layers]
+        host = [
+            (layer.keys.cpu().pin_memory(), layer.values.cpu().pin_memory())
+            for layer in prompt.past_key_values.layers
+        ]
         scores = packet["priority_scores"].to("cuda")
-        order = page_order(ids.shape[1], index["page_size"], args.order,
-                           index["seed"] + request_index, scores)
-        positions = visible_positions(ids.shape[1], index["page_size"], args.fraction,
-                                      order, torch.device("cuda"))
+        order = page_order(
+            ids.shape[1],
+            index["page_size"],
+            args.order,
+            index["seed"] + request_index,
+            scores,
+        )
+        positions = visible_positions(
+            ids.shape[1], index["page_size"], args.fraction, order, torch.device("cuda")
+        )
         anchor_keys = torch.stack([host[layer][0] for layer in LAYER_IDS], dim=1)
         anchor_values = torch.stack([host[layer][1] for layer in LAYER_IDS], dim=1)
         cpu_positions = positions.cpu()
-        anchor = (anchor_keys.index_select(-2, cpu_positions).pin_memory(),
-                  anchor_values.index_select(-2, cpu_positions).pin_memory())
+        anchor = (
+            anchor_keys.index_select(-2, cpu_positions).pin_memory(),
+            anchor_values.index_select(-2, cpu_positions).pin_memory(),
+        )
         del prompt, anchor_keys, anchor_values
         target.config._attn_implementation = (
             register_shape_invariant_attention()
-            if args.verifier_semantics == "bitwise" else "eager"
+            if args.verifier_semantics == "bitwise"
+            else "eager"
         )
         # Warm only model kernels; timed runs always allocate fresh target cache.
         warm_k = anchor[0].to("cuda")
         warm_v = anchor[1].to("cuda")
         with torch.autocast("cuda", dtype=torch.bfloat16):
             drafter.propose(
-                seed, target.model.embed_tokens, target.lm_head,
-                warm_k, warm_v, positions, ids.shape[1], length=args.proposal_tokens,
+                seed,
+                target.model.embed_tokens,
+                target.lm_head,
+                warm_k,
+                warm_v,
+                positions,
+                ids.shape[1],
+                length=args.proposal_tokens,
             )
         torch.cuda.synchronize()
         del warm_k, warm_v
         for repeat in range(args.repeats):
-            order_conditions = ("baseline", "speculative") if repeat % 2 == 0 else (
-                "speculative", "baseline"
+            order_conditions = (
+                ("baseline", "speculative")
+                if repeat % 2 == 0
+                else ("speculative", "baseline")
             )
             pair = {}
             for condition in order_conditions:
                 pair[condition] = run_condition(
-                    target, drafter, host, anchor, seed, ids.shape[1], positions,
-                    args.gbps, args.proposal_tokens, condition, args.verifier_semantics
+                    target,
+                    drafter,
+                    host,
+                    anchor,
+                    seed,
+                    ids.shape[1],
+                    positions,
+                    args.gbps,
+                    args.proposal_tokens,
+                    condition,
+                    args.verifier_semantics,
+                    args.target_start_mode,
                 )
             progress = len(pair["speculative"]["committed"])
             baseline = pair["baseline"]
@@ -423,13 +609,22 @@ def main():
                 "actual_fraction": positions.numel() / ids.shape[1],
                 "proposal_tokens": args.proposal_tokens,
                 "progress_tokens": progress,
-                "committed_output_equal": baseline["committed"] == pair["speculative"]["committed"],
+                "committed_output_equal": baseline["committed"]
+                == pair["speculative"]["committed"],
                 **pair,
             }
             rows.append(row)
             write_json(output / "progress.json", {"rows": rows})
-        print(json.dumps({"event": "integrated", "completed": request_index + 1,
-                          "total": min(args.requests, len(index["entries"]))}), flush=True)
+        print(
+            json.dumps(
+                {
+                    "event": "integrated",
+                    "completed": request_index + 1,
+                    "total": min(args.requests, len(index["entries"])),
+                }
+            ),
+            flush=True,
+        )
     summary = summarize(rows, args)
     write_json(output / "results.json", {"summary": summary, "rows": rows})
     write_json(output / "summary.json", summary)

@@ -94,6 +94,14 @@ generated token was verified must be explicit.
 4. QuantSpec hierarchical quantized draft after full transfer;
 5. SparseCache-PD with the same proposal cap and verifier.
 
+As of the 2026-09-10 audit, Lynx starts its parallel verifier only after the
+Residual stream is fully received and dequantized (Sections 4.2--4.3).  The
+current SparseCache-PD structural hypothesis instead starts exact Target layer
+`l` when that layer's complete original KV is ready, while later-layer KV is
+still in flight.  This precise timing distinction must be tested with a
+wait-full/layer-ready 2x2 ablation and must not be broadened into a claim that
+SparseCache invented partial-KV drafting.
+
 This group answers whether the proposed sparse draft is actually cheap. It
 must use matched model/checkpoint, context, batch, proposal length, and target
 verifier. Network waiting is excluded or identically charged.

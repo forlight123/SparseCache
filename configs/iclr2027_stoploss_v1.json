@@ -1,0 +1,43 @@
+{
+  "version": "iclr2027-stoploss-v1",
+  "thresholds": {
+    "layer_ready_verifier": {
+      "min_requests": 64,
+      "min_copy_verify_speedup": 1.25,
+      "min_saving_ci_lower_ms": 0.0,
+      "require_bitwise_same_work": true
+    },
+    "task_unseen_proposer": {
+      "min_tasks": 2,
+      "min_total_requests": 100,
+      "min_natural_output_tokens": 32,
+      "min_proposal_horizon": 8,
+      "min_mean_accepted": 3.5
+    },
+    "integrated_proxy": {
+      "required_bandwidth_gbps": [25, 50],
+      "min_requests_per_cell": 100,
+      "min_equal_progress_speedup": 1.10,
+      "min_saving_ci_lower_ms": 0.0,
+      "max_first_commit_ci_upper_ms": 5.0,
+      "max_output_mismatch_requests": 0,
+      "max_byte_relative_error": 0.001,
+      "max_mean_draft_overrun_ms": 0.0
+    },
+    "live_two_node": {
+      "min_requests": 100,
+      "min_end_to_end_speedup": 1.10,
+      "min_saving_ci_lower_ms": 0.0,
+      "max_output_mismatch_requests": 0
+    },
+    "paper_breadth": {
+      "min_target_models": 2,
+      "min_task_unseen_tasks": 2
+    }
+  },
+  "caps": {
+    "max_proposer_architecture_revisions": 2,
+    "max_proposer_gpu_hours": 200,
+    "max_live_optimization_rounds": 2
+  }
+}
