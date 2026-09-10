@@ -57,6 +57,25 @@ def run(args: argparse.Namespace) -> dict:
     session = requests.Session()
     session.trust_env = False
     rows = []
+    output_path = Path(args.output)
+
+    def result(status: str) -> dict:
+        return {
+            "status": status,
+            "contract": (
+                "single live LMCache P/D endpoint; packet token IDs submitted "
+                "directly; greedy output IDs compared with an immutable full-KV "
+                "Target trajectory"
+            ),
+            "packets": str(packet_root),
+            "model": args.model,
+            "pd_url": args.pd_url,
+            "max_input_tokens": args.max_input_tokens,
+            "max_new_tokens": args.max_new_tokens,
+            "requested_requests": len(entries),
+            "rows": rows,
+        }
+
     for ordinal, entry in enumerate(entries):
         packet = load_packet(packet_root, entry)
         prompt_ids = [
@@ -71,9 +90,7 @@ def run(args: argparse.Namespace) -> dict:
             "temperature": 0,
             "stream": True,
         }
-        output = stream_completion(
-            session, args.pd_url, payload, timeout=args.timeout
-        )
+        output = stream_completion(session, args.pd_url, payload, timeout=args.timeout)
         row = {
             "ordinal": ordinal,
             "packet_index": entry["index"],
@@ -85,6 +102,10 @@ def run(args: argparse.Namespace) -> dict:
             "outputs_equal": output["token_ids"] == expected,
         }
         rows.append(row)
+        # Preserve completed requests if a later streamed response stalls.  A
+        # running checkpoint is not a valid final benchmark and is marked as
+        # such explicitly.
+        write_json(output_path, result("running"))
         print(
             json.dumps(
                 {
@@ -100,23 +121,11 @@ def run(args: argparse.Namespace) -> dict:
             flush=True,
         )
 
-    result = {
-        "contract": (
-            "single live LMCache P/D endpoint; packet token IDs submitted "
-            "directly; greedy output IDs compared with an immutable full-KV "
-            "Target trajectory"
-        ),
-        "packets": str(packet_root),
-        "model": args.model,
-        "pd_url": args.pd_url,
-        "max_input_tokens": args.max_input_tokens,
-        "max_new_tokens": args.max_new_tokens,
-        "summary": summarize(rows),
-        "rows": rows,
-    }
-    write_json(Path(args.output), result)
-    print(json.dumps(result["summary"], indent=2), flush=True)
-    return result
+    completed = result("completed")
+    completed["summary"] = summarize(rows)
+    write_json(output_path, completed)
+    print(json.dumps(completed["summary"], indent=2), flush=True)
+    return completed
 
 
 def main() -> None:
@@ -124,9 +133,7 @@ def main() -> None:
     parser.add_argument("--packets", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--model", default="/data/models/qwen/Qwen3-8B")
-    parser.add_argument(
-        "--pd-url", default="http://127.0.0.1:19100/v1/completions"
-    )
+    parser.add_argument("--pd-url", default="http://127.0.0.1:19100/v1/completions")
     parser.add_argument("--num-requests", type=int, default=64)
     parser.add_argument("--max-input-tokens", type=int, default=8192)
     parser.add_argument("--max-new-tokens", type=int, default=8)

@@ -252,6 +252,37 @@ def _notify_draft_ready(draft: ReadyDraft) -> None:
     )
 
 
+def _notify_verify_feedback(
+    draft: ReadyDraft,
+    *,
+    accepted_prefix: int,
+    accepted_injected_suffix: int,
+    proposal_tokens: int,
+    num_tokens_no_spec: int,
+) -> None:
+    """Tell the proxy whether strict canonical replay is required."""
+
+    endpoint = os.environ.get("SPARSECACHE_VERIFY_NOTIFY", "")
+    if not endpoint:
+        return
+    from experiments.lossless_pd.lmcache_pd.anchor_runtime import (
+        _send_anchor_notification,
+    )
+
+    _send_anchor_notification(
+        endpoint,
+        {
+            "event": "verify_feedback",
+            "request_id": draft.request_id,
+            "pd_request_id": draft.pd_request_id,
+            "accepted_prefix": accepted_prefix,
+            "accepted_injected_suffix": accepted_injected_suffix,
+            "proposal_tokens": proposal_tokens,
+            "num_tokens_no_spec": num_tokens_no_spec,
+        },
+    )
+
+
 def _publish_for_early_dispatch(mailbox: Any, draft: ReadyDraft) -> None:
     """Publish proposals locally, then gate early D dispatch on layer readiness."""
 
@@ -1182,9 +1213,7 @@ class LiveExternalDrafter:
                 row = json.loads(payload)
                 if row.get("event") != "external_draft":
                     continue
-                draft = ready_draft_from_external_payload(
-                    row, received_ns=received_ns
-                )
+                draft = ready_draft_from_external_payload(row, received_ns=received_ns)
                 if len(draft.proposals) > self.draft_tokens:
                     raise ValueError("external proposal exceeds configured horizon")
                 _REGISTRY.publish(draft)
@@ -1234,7 +1263,9 @@ class LiveExternalDrafter:
 
 
 _SERVICE_LOCK = threading.Lock()
-_SERVICE: LiveSparseDrafter | LiveSparseTargetDrafter | LiveExternalDrafter | None = None
+_SERVICE: LiveSparseDrafter | LiveSparseTargetDrafter | LiveExternalDrafter | None = (
+    None
+)
 
 
 def get_online_drafter() -> (
@@ -1245,9 +1276,7 @@ def get_online_drafter() -> (
     global _SERVICE
     kind = os.environ.get("SPARSECACHE_DRAFTER_KIND", "block")
     if kind not in {"block", "target", "external"}:
-        raise ValueError(
-            "SPARSECACHE_DRAFTER_KIND must be block, target, or external"
-        )
+        raise ValueError("SPARSECACHE_DRAFTER_KIND must be block, target, or external")
     checkpoint = os.environ.get("SPARSECACHE_DRAFTER_CHECKPOINT", "")
     target_path = os.environ.get("SPARSECACHE_TARGET_DRAFTER_MODEL", "")
     if kind == "block" and not checkpoint:
@@ -1328,6 +1357,13 @@ class OnlineSparseKVProposer:
                         max(1, num_tokens - (draft.prompt_tokens + 2)),
                     )
                     accepted_injected_suffix = max(0, accepted - 1)
+                    _notify_verify_feedback(
+                        draft,
+                        accepted_prefix=accepted,
+                        accepted_injected_suffix=accepted_injected_suffix,
+                        proposal_tokens=pending.proposal_tokens,
+                        num_tokens_no_spec=num_tokens,
+                    )
                     if self.trace_path:
                         _append_trace(
                             self.trace_path,

@@ -9,6 +9,7 @@ proposals never cross the client boundary before Target verification.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -58,6 +59,42 @@ def external_draft_request(
     return request
 
 
+def prompt_token_digest(prompt_ids: list[int]) -> str:
+    """Return a stable digest for an exact integer-token prompt."""
+
+    payload = ",".join(str(token) for token in prompt_ids).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def load_oracle_drafts(path: Path) -> dict[str, tuple[int, ...]]:
+    """Load target trajectories used only for an optimistic systems ceiling."""
+
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if value.get("format_version") != 1 or not isinstance(value.get("rows"), list):
+        raise ValueError("oracle draft artifact must have format_version=1 and rows")
+    drafts: dict[str, tuple[int, ...]] = {}
+    for row in value["rows"]:
+        digest = row.get("prompt_sha256")
+        raw_tokens = row.get("output_token_ids")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or not isinstance(raw_tokens, list)
+            or len(raw_tokens) < 2
+            or any(
+                isinstance(token, bool) or not isinstance(token, int)
+                for token in raw_tokens
+            )
+        ):
+            raise ValueError("invalid oracle draft row")
+        if digest in drafts:
+            raise ValueError(f"duplicate oracle prompt digest: {digest}")
+        drafts[digest] = tuple(raw_tokens)
+    if not drafts:
+        raise ValueError("oracle draft artifact is empty")
+    return drafts
+
+
 def external_draft_payload(
     *,
     pd_request_id: str,
@@ -93,7 +130,9 @@ def external_token_ids(response: dict[str, Any]) -> list[int]:
     if (
         not isinstance(tokens, list)
         or not tokens
-        or any(isinstance(token, bool) or not isinstance(token, int) for token in tokens)
+        or any(
+            isinstance(token, bool) or not isinstance(token, int) for token in tokens
+        )
     ):
         raise RuntimeError("external drafter did not return integer token IDs")
     return tokens
@@ -141,11 +180,11 @@ def append_trace(path: str, row: dict[str, Any]) -> None:
 
 
 class DraftReadyMailbox:
-    """Small fail-closed UDP control mailbox keyed by both request IDs."""
+    """Small fail-closed UDP mailbox keyed by event and both request IDs."""
 
     def __init__(self, endpoint: str) -> None:
         self._condition = threading.Condition()
-        self._records: dict[str, dict[str, Any]] = {}
+        self._records: dict[tuple[str, str], dict[str, Any]] = {}
         self._running = True
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket.settimeout(0.2)
@@ -163,25 +202,29 @@ class DraftReadyMailbox:
                 return
             try:
                 row = json.loads(payload)
-                if row.get("event") != "draft_ready":
+                event = row.get("event")
+                if event not in {"draft_ready", "verify_feedback"}:
                     continue
                 with self._condition:
                     for identifier in (row.get("request_id"), row.get("pd_request_id")):
                         if identifier:
-                            self._records[str(identifier)] = row
+                            self._records[(str(event), str(identifier))] = row
                     self._condition.notify_all()
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
 
-    def wait(self, request_id: str, timeout: float) -> dict[str, Any] | None:
+    def wait(
+        self, request_id: str, timeout: float, *, event: str = "draft_ready"
+    ) -> dict[str, Any] | None:
+        key = (event, request_id)
         deadline = time.monotonic() + timeout
         with self._condition:
-            while request_id not in self._records:
+            while key not in self._records:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 self._condition.wait(remaining)
-            return self._records.pop(request_id)
+            return self._records.pop(key)
 
     def close(self) -> None:
         self._running = False
@@ -244,7 +287,9 @@ def _install_cancellable_zmq_proxy(upstream: Any) -> None:
 
     async def polling_zmq_pull_server() -> None:
         channel = upstream.zmq_ctx.socket(upstream.zmq.PULL)
-        proxy_url = f"{upstream.global_args.proxy_host}:{upstream.global_args.proxy_port}"
+        proxy_url = (
+            f"{upstream.global_args.proxy_host}:{upstream.global_args.proxy_port}"
+        )
         try:
             channel.bind(f"tcp://{proxy_url}")
         except upstream.zmq.ZMQError:
@@ -256,9 +301,7 @@ def _install_cancellable_zmq_proxy(upstream: Any) -> None:
         try:
             while upstream.run_proxy:
                 try:
-                    message_bytes = await asyncio.wait_for(
-                        channel.recv(), timeout=0.2
-                    )
+                    message_bytes = await asyncio.wait_for(channel.recv(), timeout=0.2)
                 except TimeoutError:
                     continue
                 except upstream.zmq.ZMQError as error:
@@ -300,11 +343,16 @@ def main() -> None:
     globals()["Request"] = Request
     endpoint = os.environ.get("SPARSECACHE_DRAFT_LISTEN", "udp://127.0.0.1:17610")
     timeout = float(os.environ.get("SPARSECACHE_DRAFT_READY_TIMEOUT_SEC", "30"))
-    early_dispatch = parse_bool(
-        os.environ.get("SPARSECACHE_EARLY_DISPATCH", "true")
+    early_dispatch = parse_bool(os.environ.get("SPARSECACHE_EARLY_DISPATCH", "true"))
+    canonical_replay = parse_bool(
+        os.environ.get("SPARSECACHE_CANONICAL_REPLAY_ON_REJECT", "false")
     )
     trace_path = os.environ.get("SPARSECACHE_PROXY_TRACE", "")
     external_url = os.environ.get("SPARSECACHE_EXTERNAL_DRAFT_URL", "").rstrip("/")
+    oracle_path = os.environ.get("SPARSECACHE_ORACLE_DRAFT_JSON", "")
+    oracle_drafts = (
+        load_oracle_drafts(Path(oracle_path).resolve()) if oracle_path else None
+    )
     external_model = os.environ.get(
         "SPARSECACHE_EXTERNAL_DRAFT_MODEL", "/data/models/qwen/Qwen3-4B"
     )
@@ -312,8 +360,12 @@ def main() -> None:
     external_notify = os.environ.get("SPARSECACHE_EXTERNAL_DRAFT_NOTIFY", "")
     if external_tokens <= 0:
         raise ValueError("external draft horizon must be positive")
-    if bool(external_url) != bool(external_notify):
-        raise ValueError("external draft URL and notify endpoint must be set together")
+    if external_url and oracle_drafts is not None:
+        raise ValueError("configure either external URL or oracle drafts, not both")
+    if bool(external_url or oracle_drafts is not None) != bool(external_notify):
+        raise ValueError(
+            "external URL/oracle drafts and notify endpoint must be set together"
+        )
     if external_notify:
         parse_udp_endpoint(external_notify)
     mailbox = DraftReadyMailbox(endpoint)
@@ -324,7 +376,9 @@ def main() -> None:
 
         external_client = httpx.AsyncClient(
             base_url=external_url,
-            timeout=float(os.environ.get("SPARSECACHE_EXTERNAL_DRAFT_TIMEOUT_SEC", "30")),
+            timeout=float(
+                os.environ.get("SPARSECACHE_EXTERNAL_DRAFT_TIMEOUT_SEC", "30")
+            ),
             trust_env=False,
         )
 
@@ -362,7 +416,7 @@ def main() -> None:
         return response.json()
 
     async def send_external_timed(
-        request_data: dict[str, Any]
+        request_data: dict[str, Any],
     ) -> tuple[dict[str, Any], int]:
         response = await send_external(request_data)
         return response, time.perf_counter_ns()
@@ -457,9 +511,10 @@ def main() -> None:
                 if external_prefill_task is None:
                     return False
                 try:
-                    prefill_response, concurrent_finished_ns = (
-                        await external_prefill_task
-                    )
+                    (
+                        prefill_response,
+                        concurrent_finished_ns,
+                    ) = await external_prefill_task
                     prefill_tokens = external_token_ids(prefill_response)
                     proposals = matched_external_suffix(
                         prefill_tokens,
@@ -467,9 +522,7 @@ def main() -> None:
                         max_tokens=external_tokens,
                     )
                     seed_branch_hit = proposals is not None
-                    concurrent_ms = (
-                        concurrent_finished_ns - external_started_ns
-                    ) / 1e6
+                    concurrent_ms = (concurrent_finished_ns - external_started_ns) / 1e6
                     fallback_ms = 0.0
                     if proposals is None:
                         fallback_started_ns = time.perf_counter_ns()
@@ -527,10 +580,68 @@ def main() -> None:
                     )
                     return False
 
+            async def produce_oracle_draft() -> bool:
+                if oracle_drafts is None:
+                    return False
+                started_ns = time.perf_counter_ns()
+                try:
+                    digest = prompt_token_digest(prompt_ids)
+                    target_tokens = oracle_drafts.get(digest)
+                    if target_tokens is None:
+                        raise KeyError(f"oracle has no prompt digest {digest}")
+                    if target_tokens[0] != first_token:
+                        raise ValueError(
+                            "oracle root differs from the live authoritative seed"
+                        )
+                    proposals = list(target_tokens[1 : 1 + external_tokens])
+                    if not proposals:
+                        raise ValueError("oracle trajectory has no suffix proposals")
+                    finished_ns = time.perf_counter_ns()
+                    payload = external_draft_payload(
+                        pd_request_id=pd_request_id,
+                        prompt_tokens=len(prompt_ids),
+                        seed_token_id=first_token,
+                        proposals=proposals,
+                        started_ns=started_ns,
+                        finished_ns=finished_ns,
+                        model_ms=0.0,
+                    )
+                    payload["source"] = "same_stack_target_oracle"
+                    from experiments.lossless_pd.lmcache_pd.anchor_runtime import (
+                        _send_anchor_notification,
+                    )
+
+                    _send_anchor_notification(external_notify, payload)
+                    append_trace(
+                        trace_path,
+                        {
+                            **payload,
+                            "event": "oracle_draft_submitted",
+                            "prompt_sha256": digest,
+                            "seed_branch_hit": True,
+                        },
+                    )
+                    return True
+                except Exception as error:  # noqa: BLE001
+                    append_trace(
+                        trace_path,
+                        {
+                            "event": "oracle_draft_error",
+                            "pd_request_id": pd_request_id,
+                            "error": repr(error),
+                            "finished_ns": time.perf_counter_ns(),
+                        },
+                    )
+                    return False
+
             external_draft_task = (
                 asyncio.create_task(produce_external_draft())
                 if external_prefill_task is not None
-                else None
+                else (
+                    asyncio.create_task(produce_oracle_draft())
+                    if oracle_drafts is not None
+                    else None
+                )
             )
 
             async def generate_stream():
@@ -555,9 +666,7 @@ def main() -> None:
                         "usage": None,
                     }
                     yield (
-                        "data: "
-                        + json.dumps(head, separators=(",", ":"))
-                        + "\n\n"
+                        "data: " + json.dumps(head, separators=(",", ":")) + "\n\n"
                     ).encode()
 
                     external_submitted = None
@@ -587,10 +696,66 @@ def main() -> None:
                             "dispatch_ns": dispatch_ns,
                         },
                     )
-                    async for chunk in upstream.stream_service_response(
-                        decoder.client, "/v1/completions", decoder_request
-                    ):
-                        yield chunk
+                    if not canonical_replay:
+                        async for chunk in upstream.stream_service_response(
+                            decoder.client, "/v1/completions", decoder_request
+                        ):
+                            yield chunk
+                    else:
+                        decoder_chunks = [
+                            chunk
+                            async for chunk in upstream.stream_service_response(
+                                decoder.client, "/v1/completions", decoder_request
+                            )
+                        ]
+                        verify_feedback = await asyncio.to_thread(
+                            mailbox.wait,
+                            pd_request_id,
+                            timeout,
+                            event="verify_feedback",
+                        )
+                        replay_required = (
+                            verify_feedback is None
+                            or int(verify_feedback["accepted_injected_suffix"])
+                            < int(verify_feedback["proposal_tokens"]) - 1
+                        )
+                        if replay_required:
+                            if not full_ready_task.done():
+                                await full_ready_task
+                            replay_started_ns = time.perf_counter_ns()
+                            replay_request = dict(decoder_request)
+                            replay_request.pop("kv_transfer_params", None)
+                            replay_chunks = [
+                                chunk
+                                async for chunk in upstream.stream_service_response(
+                                    decoder.client, "/v1/completions", replay_request
+                                )
+                            ]
+                            append_trace(
+                                trace_path,
+                                {
+                                    "event": "canonical_replay",
+                                    "pd_request_id": pd_request_id,
+                                    "accepted_injected_suffix": (
+                                        verify_feedback.get("accepted_injected_suffix")
+                                        if verify_feedback is not None
+                                        else None
+                                    ),
+                                    "proposal_tokens": (
+                                        verify_feedback.get("proposal_tokens")
+                                        if verify_feedback is not None
+                                        else None
+                                    ),
+                                    "feedback_timeout": verify_feedback is None,
+                                    "replay_ms": (
+                                        time.perf_counter_ns() - replay_started_ns
+                                    )
+                                    / 1e6,
+                                },
+                            )
+                            decoder_chunks = replay_chunks
+                        for chunk in decoder_chunks:
+                            yield chunk
                     if not full_ready_task.done():
                         await full_ready_task
                     append_trace(

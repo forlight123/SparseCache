@@ -82,6 +82,14 @@ observe output is the executable losslessness reference because vLLM and the
 Transformers packet builder diverge on a small, identical set of low-margin
 requests.
 
+The follow-up zero-cost Target-oracle ceiling has also completed. With the
+current verifier, `g=7` is 64/64 bitwise-equal but reaches only 1.0809x;
+`g=8,9,10` exceed 1.10x but each matches only 61/64. Canonical replay restores
+64/64 at `g=8` but falls to 1.0743x. This stops the current bitwise-verifier
+mainline and moves the next experiment to shape-invariant or numerically
+certified verification. See
+`docs/ICLR2027_ORACLE_VERIFIER_CEILING_20260910.md`.
+
 ## Runtime sequence
 
 1. P samples the exact seed through `SeedSignalProposer`. The proposer itself
