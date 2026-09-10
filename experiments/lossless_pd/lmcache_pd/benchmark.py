@@ -44,6 +44,43 @@ def bootstrap_mean_ci(
     return [means[int(0.025 * samples)], means[int(0.975 * samples)]]
 
 
+def token_score_rows(choice: dict, start_position: int) -> list[dict]:
+    """Align streamed token IDs with sampled logprobs and top-2 margins."""
+
+    token_ids = [int(value) for value in choice.get("token_ids") or []]
+    logprobs = choice.get("logprobs") or {}
+    sampled = logprobs.get("token_logprobs") or []
+    top = logprobs.get("top_logprobs") or []
+    rows = []
+    for index, token_id in enumerate(token_ids):
+        candidates = top[index] if index < len(top) else None
+        values = (
+            sorted((float(value) for value in candidates.values()), reverse=True)
+            if isinstance(candidates, dict)
+            else []
+        )
+        rows.append(
+            {
+                "position": start_position + index,
+                "token_id": token_id,
+                "sampled_logprob": (
+                    float(sampled[index])
+                    if index < len(sampled) and sampled[index] is not None
+                    else None
+                ),
+                "top1_top2_margin": (
+                    values[0] - values[1] if len(values) >= 2 else None
+                ),
+                "top_logprobs": (
+                    {str(key): float(value) for key, value in candidates.items()}
+                    if isinstance(candidates, dict)
+                    else None
+                ),
+            }
+        )
+    return rows
+
+
 def summarize(rows: list[dict]) -> dict:
     metrics = {}
     for label in ("pd", "monolithic"):
@@ -83,6 +120,7 @@ def stream_completion(
     chunks = 0
     pieces = []
     token_ids = []
+    token_scores = []
     for line in response.iter_lines(decode_unicode=True):
         if not line or not line.startswith("data: "):
             continue
@@ -98,6 +136,7 @@ def stream_completion(
             )
         choice = event["choices"][0]
         text = choice.get("text", "")
+        token_scores.extend(token_score_rows(choice, len(token_ids)))
         token_ids.extend(int(value) for value in choice.get("token_ids") or [])
         if text and first is None:
             first = time.perf_counter()
@@ -113,6 +152,7 @@ def stream_completion(
         "chunks": chunks,
         "text": "".join(pieces),
         "token_ids": token_ids,
+        "token_scores": token_scores,
     }
 
 

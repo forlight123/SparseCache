@@ -5,6 +5,8 @@ import pytest
 from experiments.lossless_pd.lmcache_pd.layerwise_pd_runtime import (
     assert_schedule_exact,
     build_transfer_schedule,
+    empty_layerwise_retrieve,
+    layerwise_retrieve_with_empty_fallback,
     parse_progressive_request,
     schedule_byte_accounting,
 )
@@ -67,3 +69,33 @@ def test_progressive_request_is_explicit_and_validated():
     request.kv_transfer_params["sparsecache_progressive"]["prompt_tokens"] = True
     with pytest.raises(ValueError):
         parse_progressive_request(request)
+
+
+def test_empty_layerwise_retrieve_preserves_adapter_protocol():
+    import torch
+
+    values = list(empty_layerwise_retrieve(torch.tensor([1, 2, 3]), 3))
+    assert len(values) == 5
+    assert values[0].item() == 0
+    assert values[1:4] == [None, None, None]
+    assert values[4].tolist() == [False, False, False]
+
+
+def test_empty_storage_lookup_supplies_missing_final_mask():
+    import torch
+
+    def broken_upstream(engine, tokens, mask=None, **kwargs):
+        del engine, tokens, mask, kwargs
+        yield None
+        raise UnboundLocalError("mem_obj_consumer is unbound")
+
+    values = list(
+        layerwise_retrieve_with_empty_fallback(
+            broken_upstream,
+            SimpleNamespace(num_layers=1),
+            torch.tensor([4, 5]),
+            mask=torch.ones(2, dtype=torch.bool),
+        )
+    )
+    assert values[0] is None
+    assert values[1].tolist() == [False, False]

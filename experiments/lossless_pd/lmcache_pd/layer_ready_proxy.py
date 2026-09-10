@@ -66,6 +66,14 @@ def prompt_token_digest(prompt_ids: list[int]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def isolated_cache_salt(pd_request_id: str) -> str:
+    """Return one stable prefix-cache namespace per logical P/D request."""
+
+    if not pd_request_id:
+        raise ValueError("P/D request ID must be nonempty")
+    return hashlib.sha256(f"sparsecache:{pd_request_id}".encode("ascii")).hexdigest()
+
+
 def load_oracle_drafts(path: Path) -> dict[str, tuple[int, ...]]:
     """Load target trajectories used only for an optimistic systems ceiling."""
 
@@ -347,6 +355,9 @@ def main() -> None:
     canonical_replay = parse_bool(
         os.environ.get("SPARSECACHE_CANONICAL_REPLAY_ON_REJECT", "false")
     )
+    isolate_prefix_cache = parse_bool(
+        os.environ.get("SPARSECACHE_ISOLATE_PREFIX_CACHE", "false")
+    )
     trace_path = os.environ.get("SPARSECACHE_PROXY_TRACE", "")
     external_url = os.environ.get("SPARSECACHE_EXTERNAL_DRAFT_URL", "").rstrip("/")
     oracle_path = os.environ.get("SPARSECACHE_ORACLE_DRAFT_JSON", "")
@@ -443,6 +454,10 @@ def main() -> None:
         try:
             request_data = await request.json()
             request_received_ns = time.perf_counter_ns()
+            if isolate_prefix_cache:
+                # P, D, and an optional replay share this salt, but adjacent
+                # logical requests cannot consume one another's vLLM blocks.
+                request_data["cache_salt"] = isolated_cache_salt(pd_request_id)
             tokenizer, prefiller, decoder = upstream.pick_up_clients(request)
             tokenized = await upstream.send_request_to_service(
                 tokenizer.client, "/tokenize", {"prompt": request_data["prompt"]}

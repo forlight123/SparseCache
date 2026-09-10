@@ -95,8 +95,13 @@ def stop_processes(processes: list[subprocess.Popen]) -> None:
             process.wait(timeout=5)
 
 
-def vllm_common(port: int) -> list[str]:
-    return [
+def vllm_common(
+    port: int,
+    attention_backend: str | None = None,
+    *,
+    enable_prefix_caching: bool = False,
+) -> list[str]:
+    command = [
         str(VLLM),
         "serve",
         str(MODEL),
@@ -113,10 +118,17 @@ def vllm_common(port: int) -> list[str]:
         "--max-num-seqs",
         "1",
         "--no-async-scheduling",
-        "--no-enable-prefix-caching",
         "--enforce-eager",
         "--disable-log-stats",
     ]
+    command.append(
+        "--enable-prefix-caching"
+        if enable_prefix_caching
+        else "--no-enable-prefix-caching"
+    )
+    if attention_backend:
+        command.extend(["--attention-backend", attention_backend])
+    return command
 
 
 def run(args: argparse.Namespace) -> None:
@@ -181,14 +193,22 @@ def run(args: argparse.Namespace) -> None:
         f"{args.speculative_tokens}}}"
     )
     p_command = [
-        *vllm_common(args.prefiller_port),
+        *vllm_common(
+            args.prefiller_port,
+            args.attention_backend,
+            enable_prefix_caching=args.enable_prefix_caching,
+        ),
         "--speculative-config",
         proposer_p,
         "--kv-transfer-config",
         '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_producer"}',
     ]
     d_command = [
-        *vllm_common(args.decoder_port),
+        *vllm_common(
+            args.decoder_port,
+            args.attention_backend,
+            enable_prefix_caching=args.enable_prefix_caching,
+        ),
         "--speculative-config",
         proposer_d,
         "--kv-transfer-config",
@@ -234,6 +254,9 @@ def run(args: argparse.Namespace) -> None:
             "SPARSECACHE_EARLY_DISPATCH": "true",
             "SPARSECACHE_CANONICAL_REPLAY_ON_REJECT": str(
                 args.canonical_replay
+            ).lower(),
+            "SPARSECACHE_ISOLATE_PREFIX_CACHE": str(
+                args.enable_prefix_caching
             ).lower(),
         }
         proxy_command = [
@@ -301,6 +324,10 @@ def run(args: argparse.Namespace) -> None:
             "--pd-url",
             f"http://127.0.0.1:{args.proxy_port}/v1/completions",
         ]
+        if args.packet_indices:
+            benchmark_command.extend(["--packet-indices", args.packet_indices])
+        if args.logprobs > 0:
+            benchmark_command.extend(["--logprobs", str(args.logprobs)])
         with (output_dir / "benchmark.log").open("wb") as handle:
             subprocess.run(
                 benchmark_command,
@@ -322,6 +349,10 @@ def main() -> None:
     parser.add_argument("--oracle", type=Path, required=True)
     parser.add_argument("--mode", choices=("observe", "inject"), required=True)
     parser.add_argument("--num-requests", type=int, default=64)
+    parser.add_argument(
+        "--packet-indices",
+        help="comma-separated exact packet indexes; overrides --num-requests selection",
+    )
     parser.add_argument("--max-input-tokens", type=int, default=8192)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--draft-tokens", type=int, default=8)
@@ -332,7 +363,22 @@ def main() -> None:
     parser.add_argument("--decoder-port", type=int, default=18200)
     parser.add_argument("--proxy-port", type=int, default=19100)
     parser.add_argument("--startup-timeout", type=float, default=180)
+    parser.add_argument("--logprobs", type=int, default=0)
     parser.add_argument("--canonical-replay", action="store_true")
+    parser.add_argument(
+        "--enable-prefix-caching",
+        action="store_true",
+        help="reuse the completed speculative prefix during rare canonical replay",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        choices=(
+            "FLASH_ATTN",
+            "FLASHINFER",
+            "TRITON_ATTN",
+        ),
+        help="force the same vLLM attention backend on P and D",
+    )
     args = parser.parse_args()
     if (
         min(
@@ -345,6 +391,8 @@ def main() -> None:
         <= 0
     ):
         parser.error("request, token, and horizon values must be positive")
+    if args.logprobs < 0:
+        parser.error("logprobs must be non-negative")
     run(args)
 
 

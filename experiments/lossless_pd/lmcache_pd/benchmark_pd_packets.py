@@ -32,6 +32,25 @@ def expected_output_ids(packet: dict, max_new_tokens: int) -> list[int]:
     return [seed, *suffix[: max(0, max_new_tokens - 1)]]
 
 
+def select_packet_entries(
+    entries: list[dict], count: int, packet_indices: str | None
+) -> list[dict]:
+    """Select either the stratified benchmark set or exact packet indices."""
+
+    if packet_indices is None:
+        return select_entries(entries, count)
+    requested = [int(value.strip()) for value in packet_indices.split(",")]
+    if not requested or any(value < 0 for value in requested):
+        raise ValueError("packet indices must be a non-empty list of non-negative ints")
+    if len(set(requested)) != len(requested):
+        raise ValueError("packet indices must be unique")
+    by_index = {int(entry["index"]): entry for entry in entries}
+    missing = [value for value in requested if value not in by_index]
+    if missing:
+        raise ValueError(f"packet indices not found: {missing}")
+    return [by_index[value] for value in requested]
+
+
 def summarize(rows: list[dict]) -> dict:
     metrics = {
         key: statistics.fmean(row["pd"][key] for row in rows)
@@ -53,7 +72,9 @@ def summarize(rows: list[dict]) -> dict:
 
 def run(args: argparse.Namespace) -> dict:
     packet_root = Path(args.packets).resolve()
-    entries = select_entries(read_index(packet_root)["entries"], args.num_requests)
+    entries = select_packet_entries(
+        read_index(packet_root)["entries"], args.num_requests, args.packet_indices
+    )
     session = requests.Session()
     session.trust_env = False
     rows = []
@@ -90,6 +111,8 @@ def run(args: argparse.Namespace) -> dict:
             "temperature": 0,
             "stream": True,
         }
+        if args.logprobs > 0:
+            payload["logprobs"] = args.logprobs
         output = stream_completion(session, args.pd_url, payload, timeout=args.timeout)
         row = {
             "ordinal": ordinal,
@@ -135,12 +158,19 @@ def main() -> None:
     parser.add_argument("--model", default="/data/models/qwen/Qwen3-8B")
     parser.add_argument("--pd-url", default="http://127.0.0.1:19100/v1/completions")
     parser.add_argument("--num-requests", type=int, default=64)
+    parser.add_argument(
+        "--packet-indices",
+        help="comma-separated exact packet indexes; overrides --num-requests selection",
+    )
     parser.add_argument("--max-input-tokens", type=int, default=8192)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--logprobs", type=int, default=0)
     args = parser.parse_args()
     if min(args.num_requests, args.max_input_tokens, args.max_new_tokens) <= 0:
         parser.error("request counts and token limits must be positive")
+    if args.logprobs < 0:
+        parser.error("logprobs must be non-negative")
     run(args)
 
 

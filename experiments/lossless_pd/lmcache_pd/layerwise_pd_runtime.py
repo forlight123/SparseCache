@@ -57,6 +57,65 @@ class TransferPhase:
     is_last: bool = False
 
 
+def empty_layerwise_retrieve(tokens, num_layers: int):
+    """Emit LMCache's layerwise protocol for an already-vLLM-cached prefix."""
+
+    import torch
+
+    if num_layers <= 0:
+        raise ValueError("num_layers must be positive")
+    ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+    # LMCache's vLLM adapter primes twice, advances once per layer, and reads
+    # the final mask after the device synchronization marker.
+    yield torch.sum(ret_mask)
+    for _ in range(1, num_layers):
+        yield None
+    yield None
+    yield ret_mask
+
+
+def layerwise_retrieve_with_empty_fallback(
+    original, engine, tokens, mask=None, **kwargs
+):
+    """Complete the upstream generator when its storage lookup is empty."""
+
+    import torch
+
+    if mask is not None and not bool(mask.any().item()):
+        yield from empty_layerwise_retrieve(tokens, int(engine.num_layers))
+        return
+    try:
+        yield from original(engine, tokens, mask=mask, **kwargs)
+    except UnboundLocalError as error:
+        # LMCache 0.5.4rc5 reaches this point only after emitting every layer
+        # marker for an empty storage lookup.  Supply the missing final mask;
+        # do not hide unrelated failures from the upstream generator.
+        if "mem_obj_consumer" not in str(error):
+            raise
+        yield torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+
+
+def _patch_empty_layerwise_retrieve() -> None:
+    """Handle requests fully covered by vLLM prefix caching.
+
+    LMCache 0.5.4rc5's layerwise generator unconditionally synchronizes an
+    undefined ``mem_obj_consumer`` when its retrieval mask contains no work.
+    This state is expected during canonical repair because the just-finished
+    speculative request leaves the immutable prompt resident in vLLM.
+    """
+
+    from lmcache.v1.cache_engine import LMCacheEngine
+
+    original = LMCacheEngine.retrieve_layer
+
+    def retrieve_with_empty_prefix(self, tokens, mask=None, **kwargs):
+        yield from layerwise_retrieve_with_empty_fallback(
+            original, self, tokens, mask=mask, **kwargs
+        )
+
+    LMCacheEngine.retrieve_layer = retrieve_with_empty_prefix
+
+
 def build_transfer_schedule(
     num_layers: int,
     num_chunks: int,
@@ -1039,6 +1098,7 @@ def install() -> None:
     _patch_layerwise_connector_format()
     _patch_layerwise_direct_scatter()
     _patch_pd_receiver_get()
+    _patch_empty_layerwise_retrieve()
     _patch_layerwise_store(
         draft_layers=draft_layers,
         fraction=fraction,

@@ -705,3 +705,14 @@ The implementation is in
 `experiments/reuse_cacheblend_pipeline.py`, aggregation is in
 `experiments/aggregate_reuse_cacheblend_pipeline.py`, and the complete report
 is [`outputs/reuse_pipeline/TRUE_REUSE_PROGRESSIVE_REPORT.md`](outputs/reuse_pipeline/TRUE_REUSE_PROGRESSIVE_REPORT.md).
+
+## Lossless verifier status
+
+The real LMCache oracle ceiling now reaches 64/64 same-stack token-ID equality
+and 1.1065x total speedup for an eight-token block after request-scoped prefix
+caching and rare canonical replay. A stronger 32-token continuation test is
+only 58/64 exact: fully accepted BF16 block representations can later diverge
+from ordinary `q=1` decoding. Backend, horizon, and logit-margin scans do not
+provide a lossless fix. The next gated mainline is a shape-invariant block
+verifier; see
+[`docs/ICLR2027_SHAPE_INVARIANT_VERIFIER_20260910.md`](docs/ICLR2027_SHAPE_INVARIANT_VERIFIER_20260910.md).

@@ -4,6 +4,7 @@ from experiments.lossless_pd.lmcache_pd.layer_ready_proxy import (
     external_draft_payload,
     external_draft_request,
     external_token_ids,
+    isolated_cache_salt,
     matched_external_suffix,
     parse_bool,
     parse_udp_endpoint,
@@ -53,6 +54,13 @@ def test_layer_ready_proxy_boolean_contract():
     assert parse_bool("0") is False
     with pytest.raises(ValueError):
         parse_bool("maybe")
+
+
+def test_prefix_cache_salt_is_request_scoped_and_stable():
+    first = isolated_cache_salt("pd-7")
+    assert len(first) == 64
+    assert first == isolated_cache_salt("pd-7")
+    assert first != isolated_cache_salt("pd-8")
 
 
 def test_external_draft_request_strips_target_transfer_state():

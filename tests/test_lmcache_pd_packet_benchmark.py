@@ -2,6 +2,7 @@ import torch
 
 from experiments.lossless_pd.lmcache_pd.benchmark_pd_packets import (
     expected_output_ids,
+    select_packet_entries,
     summarize,
 )
 from experiments.lossless_pd.lmcache_pd.compare_online_modes import sandwich_summary
@@ -47,3 +48,19 @@ def test_sandwich_supports_reference_only_packet_runs():
     assert result["all_three_equal_reference"] == 1
     assert result["inject_minus_sandwich_observe_total_ms"]["mean_ms"] == -3.0
     assert "sandwich_difference_in_differences_total_ms" not in result
+
+
+def test_select_packet_entries_preserves_explicit_order():
+    entries = [{"index": 25}, {"index": 57}, {"index": 61}]
+    assert select_packet_entries(entries, 1, "61,25") == [entries[2], entries[0]]
+
+
+def test_select_packet_entries_rejects_missing_or_duplicates():
+    entries = [{"index": 25}]
+    for requested in ("25,25", "99"):
+        try:
+            select_packet_entries(entries, 1, requested)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {requested}")

@@ -1,0 +1,77 @@
+{
+  "date": "2026-09-10",
+  "status": "short_horizon_gate_passed_continuation_gate_failed",
+  "contract": {
+    "scenario": "real LMCache layerwise 1P1D over NIXL CUDA-IPC",
+    "model": "/data/models/qwen/Qwen3-8B",
+    "hardware": "2x NVIDIA H200 NVL; GPU0=P, GPU1=D",
+    "dataset": "64 length-stratified QMSum immutable packet prompts",
+    "input_tokens": "2560-8192",
+    "decoding": "greedy, one request at a time",
+    "draft": "zero-cost same-stack Target oracle; systems ceiling only",
+    "lossless_gate": "fresh-server same-stack token-ID equality"
+  },
+  "short_horizon_g8": {
+    "max_output_tokens": 9,
+    "attention_backend": "FLASHINFER",
+    "request_scoped_prefix_cache_salt": true,
+    "canonical_replay_on_reject": true,
+    "requests": 64,
+    "exact_trajectories": 64,
+    "accepted_suffix_mean": 6.65625,
+    "accepted_suffix_distribution": {"1": 2, "2": 2, "7": 60},
+    "canonical_replays": 4,
+    "canonical_replay_mean_ms": 134.62487675,
+    "observe_sandwich_total_ms": 869.5544443089602,
+    "inject_total_ms": 785.874987122952,
+    "speedup": 1.1064793492058507,
+    "saving_ms": 83.67945718600822,
+    "saving_bootstrap_95ci_ms": [69.12473868396773, 96.59520001150668],
+    "gate_passed": true
+  },
+  "continuation_32": {
+    "max_output_tokens": 33,
+    "attention_backend": "FLASHINFER",
+    "requests": 64,
+    "exact_trajectories": 58,
+    "representation_drift_ordinals": [16, 18, 25, 42, 48, 62],
+    "first_divergence_positions": [31, 29, 19, 13, 13, 16],
+    "all_drifted_blocks_fully_accepted": true,
+    "observe_total_ms": 1235.200700837595,
+    "inject_total_ms": 1154.5739498578769,
+    "speedup": 1.069832470228211,
+    "gate_passed": false
+  },
+  "backend_and_horizon_stop_loss": {
+    "flash_attn_on_flashinfer_drift6_exact": "4/6",
+    "triton_attn_on_hard9_exact_with_replay": "8/9",
+    "flashinfer_g6_on_drift6_exact_with_replay": "4/6",
+    "flashinfer_g4_on_drift6_exact_with_replay": "2/6",
+    "decision": "stop backend and horizon enumeration"
+  },
+  "margin_gate_n64": {
+    "diagnostic_only": true,
+    "drift_requests": 6,
+    "threshold_0": {"recall": 0.5, "repair_fraction": 0.296875},
+    "threshold_0_25": {
+      "recall": 1.0,
+      "false_positives": 40,
+      "repair_fraction": 0.71875
+    },
+    "decision": "reject margin-only repair as the lossless mainline"
+  },
+  "next_gate": {
+    "name": "shape_invariant_block_verifier",
+    "microkernel": {
+      "bitwise_equal_kv_and_logits_to_q1": true,
+      "random_and_real_states": 1000,
+      "max_latency_vs_standard_block": 1.5,
+      "max_latency_vs_eight_q1_steps": 0.45
+    },
+    "hard9": {"exact_32_token_trajectories": "9/9"},
+    "n64": {
+      "exact_32_token_trajectories": "64/64",
+      "minimum_total_speedup": 1.08
+    }
+  }
+}

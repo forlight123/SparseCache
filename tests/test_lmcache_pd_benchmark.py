@@ -4,6 +4,7 @@ from experiments.lossless_pd.lmcache_pd.benchmark import (
     bootstrap_mean_ci,
     select_entries,
     summarize,
+    token_score_rows,
 )
 
 
@@ -47,3 +48,23 @@ def test_summarize_uses_paired_latency_deltas():
 
 def test_bootstrap_singleton_is_exact():
     assert bootstrap_mean_ci([2.5]) == pytest.approx([2.5, 2.5])
+
+
+def test_token_score_rows_aligns_top2_margin_with_delta_ids():
+    rows = token_score_rows(
+        {
+            "token_ids": [11, 13],
+            "logprobs": {
+                "token_logprobs": [-0.1, -0.2],
+                "top_logprobs": [
+                    {"a": -0.1, "b": -0.6},
+                    {"c": -0.2, "d": -1.0},
+                ],
+            },
+        },
+        4,
+    )
+    assert [row["position"] for row in rows] == [4, 5]
+    assert [row["token_id"] for row in rows] == [11, 13]
+    assert [row["top1_top2_margin"] for row in rows] == pytest.approx([0.5, 0.8])
+    assert rows[0]["top_logprobs"] == {"a": -0.1, "b": -0.6}
