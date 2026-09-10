@@ -150,6 +150,15 @@ def run(args: argparse.Namespace) -> None:
         ]
     )
     base = local_env()
+    if args.shape_invariant_verifier:
+        base.update(
+            {
+                "SPARSECACHE_SHAPE_INVARIANT_VERIFIER": "1",
+                "SPARSECACHE_SHAPE_FIXED_SPLIT_PAGES": str(
+                    args.shape_fixed_split_pages
+                ),
+            }
+        )
     p_env = {
         **base,
         "CUDA_VISIBLE_DEVICES": str(args.prefill_gpu),
@@ -366,6 +375,15 @@ def main() -> None:
     parser.add_argument("--logprobs", type=int, default=0)
     parser.add_argument("--canonical-replay", action="store_true")
     parser.add_argument(
+        "--shape-invariant-verifier",
+        action="store_true",
+        help=(
+            "verify uniform speculative blocks as fixed-split batched qlen=1 "
+            "FlashInfer queries"
+        ),
+    )
+    parser.add_argument("--shape-fixed-split-pages", type=int, default=64)
+    parser.add_argument(
         "--enable-prefix-caching",
         action="store_true",
         help="reuse the completed speculative prefix during rare canonical replay",
@@ -393,6 +411,10 @@ def main() -> None:
         parser.error("request, token, and horizon values must be positive")
     if args.logprobs < 0:
         parser.error("logprobs must be non-negative")
+    if args.shape_fixed_split_pages <= 0:
+        parser.error("--shape-fixed-split-pages must be positive")
+    if args.shape_invariant_verifier and args.attention_backend != "FLASHINFER":
+        parser.error("shape-invariant verifier requires --attention-backend FLASHINFER")
     run(args)
 
 

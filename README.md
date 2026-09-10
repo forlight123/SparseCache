@@ -708,11 +708,13 @@ is [`outputs/reuse_pipeline/TRUE_REUSE_PROGRESSIVE_REPORT.md`](outputs/reuse_pip
 
 ## Lossless verifier status
 
-The real LMCache oracle ceiling now reaches 64/64 same-stack token-ID equality
-and 1.1065x total speedup for an eight-token block after request-scoped prefix
-caching and rare canonical replay. A stronger 32-token continuation test is
-only 58/64 exact: fully accepted BF16 block representations can later diverge
-from ordinary `q=1` decoding. Backend, horizon, and logit-margin scans do not
-provide a lossless fix. The next gated mainline is a shape-invariant block
-verifier; see
+The real LMCache oracle ceiling now has a shape-invariant block verifier. It
+maps a speculative block to fixed-split FlashInfer `q=1` rows that share the
+same physical paged KV cache but expose progressively longer causal prefixes.
+The original block verifier was only 58/64 exact after a 32-token continuation;
+the new path is 64/64 exact in two independent runs, needs no canonical replay,
+and reaches 1.0832x and 1.0820x total speedup. The second run saves 91.93 ms per
+request (paired 95% CI [85.92, 98.34] ms). The verifier ceiling has therefore
+passed its pre-registered 1.08x gate; a deployable sparse-KV drafter remains the
+next gate. See
 [`docs/ICLR2027_SHAPE_INVARIANT_VERIFIER_20260910.md`](docs/ICLR2027_SHAPE_INVARIANT_VERIFIER_20260910.md).

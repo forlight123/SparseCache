@@ -82,13 +82,25 @@ observe output is the executable losslessness reference because vLLM and the
 Transformers packet builder diverge on a small, identical set of low-margin
 requests.
 
-The follow-up zero-cost Target-oracle ceiling has also completed. With the
-current verifier, `g=7` is 64/64 bitwise-equal but reaches only 1.0809x;
-`g=8,9,10` exceed 1.10x but each matches only 61/64. Canonical replay restores
-64/64 at `g=8` but falls to 1.0743x. This stops the current bitwise-verifier
-mainline and moves the next experiment to shape-invariant or numerically
-certified verification. See
-`docs/ICLR2027_ORACLE_VERIFIER_CEILING_20260910.md`.
+The follow-up zero-cost Target-oracle ceiling first exposed state drift: a
+normal block verifier was only 58/64 exact after 32 continuation tokens even
+when all six divergent blocks were fully accepted. The replacement
+shape-invariant verifier expands each speculative position into a fixed-split
+FlashInfer decode row with its own causal KV length. It is 64/64 exact on two
+independent full runs without replay and reaches 1.0832x and 1.0820x total
+speedup, passing the pre-registered 1.08x continuation gate. See
+`docs/ICLR2027_SHAPE_INVARIANT_VERIFIER_20260910.md`.
+
+Enable the prototype on both P and D with:
+
+```text
+SPARSECACHE_SHAPE_INVARIANT_VERIFIER=1
+SPARSECACHE_SHAPE_FIXED_SPLIT_PAGES=64
+```
+
+The current runtime gate additionally requires `FLASHINFER`, eager execution,
+and a pure uniform speculative-decode batch. The runner exposes this as
+`--shape-invariant-verifier --shape-fixed-split-pages 64`.
 
 ## Runtime sequence
 

@@ -2,6 +2,11 @@
 
 import os
 
+if os.environ.get("SPARSECACHE_SHAPE_INVARIANT_VERIFIER") == "1":
+    from experiments.lossless_pd.lmcache_pd.shape_invariant_vllm import install
+
+    install()
+
 
 if os.environ.get("SPARSECACHE_LAYERWISE_PD_PATCH") == "1":
     from experiments.lossless_pd.lmcache_pd.layerwise_pd_runtime import install

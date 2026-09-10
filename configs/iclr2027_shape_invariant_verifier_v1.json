@@ -1,6 +1,6 @@
 {
   "date": "2026-09-10",
-  "status": "short_horizon_gate_passed_continuation_gate_failed",
+  "status": "shape_invariant_continuation_gate_passed_drafter_pending",
   "contract": {
     "scenario": "real LMCache layerwise 1P1D over NIXL CUDA-IPC",
     "model": "/data/models/qwen/Qwen3-8B",
@@ -60,18 +60,42 @@
     },
     "decision": "reject margin-only repair as the lossless mainline"
   },
+  "shape_invariant_attention_microbench": {
+    "flashinfer": "0.6.12",
+    "dtype": "bfloat16",
+    "page_size": 16,
+    "prefix_lengths": [509, 2557, 8189, 32765, 65529],
+    "draft_lengths": [4, 8, 16],
+    "fixed_split_pages": [32, 64, 128, 256],
+    "random_seeds_per_cell": 5,
+    "bitwise_exact_cells": "60/60",
+    "selected_fixed_split_pages": 64,
+    "selected_geomean_speedup_vs_serial_q1": 3.6936134906370515,
+    "selected_min_speedup_vs_serial_q1": 1.7003464322554303
+  },
+  "shape_invariant_continuation_32": {
+    "max_output_tokens": 33,
+    "attention_backend": "FLASHINFER",
+    "fixed_split_pages": 64,
+    "gpu_page_table_expansion": true,
+    "requests": 64,
+    "exact_trajectories": 64,
+    "accepted_suffix_mean": 7.0,
+    "canonical_replays": 0,
+    "observe_sandwich_total_ms": 1212.986477128652,
+    "inject_replicates_ms": [1119.7812896643882, 1121.058601882396],
+    "speedup_replicates": [1.0832351713004587, 1.0820009543585838],
+    "saving_replicates_ms": [93.20518746426387, 91.92787524625601],
+    "saving_bootstrap_95ci_rep2_ms": [85.92314650195476, 98.34368369411095],
+    "gate_passed": true
+  },
   "next_gate": {
-    "name": "shape_invariant_block_verifier",
-    "microkernel": {
-      "bitwise_equal_kv_and_logits_to_q1": true,
-      "random_and_real_states": 1000,
-      "max_latency_vs_standard_block": 1.5,
-      "max_latency_vs_eight_q1_steps": 0.45
-    },
-    "hard9": {"exact_32_token_trajectories": "9/9"},
-    "n64": {
-      "exact_32_token_trajectories": "64/64",
-      "minimum_total_speedup": 1.08
-    }
+    "name": "deployable_direct_sparse_kv_drafter",
+    "draft_length": 7,
+    "minimum_mean_accepted_suffix": 3.0,
+    "minimum_p10_accepted_suffix": 1,
+    "exact_32_token_trajectories": "64/64",
+    "minimum_end_to_end_speedup": 1.05,
+    "charge_drafter_compute_and_memory": true
   }
 }

@@ -4,14 +4,14 @@ Date: 2026-09-10
 
 ## Decision
 
-The real LMCache pipeline now passes the original short-horizon oracle gate,
-but it fails the stronger continuation gate. This is a useful structural
-result, not an ICLR-ready result.
+The real LMCache pipeline now passes both the original short-horizon oracle
+gate and the stronger 32-token continuation gate. This validates the verifier
+mechanism, but it is still an oracle ceiling rather than an ICLR-ready system:
+the deployable sparse-KV drafter remains unsolved.
 
-We stop searching attention backends and speculative horizons. The next
-mainline is a **shape-invariant block verifier**: preserve the canonical `q=1`
-floating-point reduction order inside every token row while parallelizing
-across draft positions.
+The successful pivot is a **shape-invariant block verifier**: preserve the
+canonical `q=1` floating-point reduction partition inside every token row while
+parallelizing across draft positions.
 
 ## Experimental contract
 
@@ -151,17 +151,86 @@ parallel schedule that keeps the per-token numerical semantics fixed while
 exposing concurrency across the token dimension, and co-schedules that work
 with progressive KV arrival.
 
-## Next gates
+## Implemented FlashInfer schedule
 
-We implement the smallest kernel prototype before touching the drafter again.
+The H200 implementation does not launch eight streams or run eight complete
+model steps. At every Target layer it writes all draft K/V rows normally, then
+represents the `g` attention queries as `g` logical decode sequences:
 
-1. **Primitive gate:** 1,000 random and real Qwen states; bitwise-equal K/V and
-   logits to `q=1`; at most 1.5x standard-block latency and at most 0.45x eight
-   serial `q=1` steps.
-2. **Hard-set gate:** 9/9 exact 32-token trajectories.
-3. **N=64 gate:** 64/64 exact 32-token trajectories and at least 1.08x total
-   speedup under the same real LMCache P/D contract.
-4. Only after these pass do we resume progressive sparse-KV drafter training.
+- every logical sequence references the same physical vLLM KV pages;
+- sequence `j` has visible length `n+j`, enforcing the causal prefix;
+- `fixed_split_size=64` pages gives every row the same 1,024-token reduction
+  partition, independent of verifier batch shape;
+- QKV/MLP work stays block-parallel; only attention metadata is expanded;
+- page tables are expanded on GPU through vLLM's existing Triton copy kernel,
+  avoiding a critical-path D2H synchronization.
+
+The opt-in integration is in
+`experiments/lossless_pd/lmcache_pd/shape_invariant_vllm.py`. It deliberately
+fails closed outside a pure, uniform speculative-decode batch. Ordinary
+prefill remains unchanged.
+
+### Attention primitive sweep
+
+On GPU2, FlashInfer 0.6.12, BF16 Qwen3 geometry (`Hq=32`, `Hkv=8`, `d=128`,
+page size 16), we swept five prefix lengths (509--65,529), draft lengths
+4/8/16, four fixed split sizes, and five random query seeds per cell:
+
+| Fixed split | Exact cells | Geomean speedup vs serial `q=1` | Minimum speedup |
+|---:|---:|---:|---:|
+| 32 pages | 15/15 | 3.36x | 1.53x |
+| 64 pages | 15/15 | 3.69x | 1.70x |
+| 128 pages | 15/15 | 4.16x | 1.79x |
+| 256 pages | 15/15 | 5.31x | 2.34x |
+
+All 300 batched-versus-serial comparisons were bitwise equal. We selected 64
+pages rather than the largest split because larger splits slow ordinary `q=1`
+decode; at the deployed 2.5K--8K range, 64 pages preserves baseline latency
+while giving `g=8` attention speedups from 6.81x to 3.31x.
+
+The reproducible sweep is
+`benchmark_shape_invariant_flashinfer.py`; raw results are in
+`outputs/progressive_kv/iclr2027_20260910/sibv_flashinfer_microbench.json`.
+
+## Continuation gate now passes
+
+The same 64 immutable real-LMCache P/D requests were rerun with 33 output
+tokens. The zero-cost same-stack Target oracle supplies one eight-token block;
+the last 24 tokens are ordinary decode and therefore test accepted state, not
+just immediate token acceptance.
+
+| Metric | Optimized run 1 | Independent inject run 2 |
+|---|---:|---:|
+| Exact 33-token trajectories | 64/64 | 64/64 |
+| Accepted injected suffix | 7.0 | 7.0 |
+| Canonical replays | 0 | 0 |
+| Observe sandwich | 1212.99 ms | 1212.99 ms |
+| Inject | 1119.78 ms | 1121.06 ms |
+| Speedup | **1.0832x** | **1.0820x** |
+| Mean saving | 93.21 ms | 91.93 ms |
+| Saving bootstrap 95% CI | [84.31, 101.82] ms | [85.92, 98.34] ms |
+
+Both repetitions pass the pre-registered 64/64, 1.08x, and positive-CI gates.
+The unoptimized Python D2H page-table path took 1129.19 ms (1.0742x); GPU
+metadata expansion recovered 9.41 ms without changing any output token.
+
+## Gate decision and next work
+
+The attention primitive and N=64 continuation gates pass. The earlier
+Transformers reference verifier also established bitwise-equal generated K/V
+and logits on 64 real states when every row-sensitive primitive is held to its
+`q=1` shape. The live vLLM test establishes the serving-stack token-trajectory
+contract; direct extraction of vLLM's accepted KV rows remains a useful audit,
+not a reason to weaken the external losslessness gate.
+
+The next stage resumes drafter work with fixed stop-loss criteria:
+
+1. replace the zero-cost oracle with a deployable direct sparse-KV proposer;
+2. require mean accepted injected suffix at least 3.0 for `g=7` on task-unseen
+   requests, with p10 accepted length at least 1;
+3. retain 64/64 same-stack continuation equality through this verifier;
+4. require at least 1.05x end-to-end speedup after charging drafter compute and
+   memory, before scaling training or claiming an ICLR system result.
 
 Raw run artifacts are under `outputs/progressive_kv/iclr2027_20260910/` and
 remain intentionally gitignored. The machine-readable stage summary is
